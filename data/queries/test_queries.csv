@@ -29,3 +29,23 @@ query_id,query,complexity,ground_truth
 27,"In what year was a Master of Arts course first offered at Notre Dame?",simple,"1854"
 28,"Which department at Notre Dame is the only one to not offer a PhD program?",simple,"Department of Pre-Professional Studies"
 29,"What institute at Notre Dame studies  the reasons for violent conflict?",simple,"Joan B. Kroc Institute for International Peace Studies"
+31,Compare the missions of different Notre Dame student publications mentioned in the document,medium,Manual evaluation needed
+32,Explain the relationship between The Observer's independence and its editorial content,medium,Manual evaluation needed
+33,What factors contributed to the shift in The Observer's political stance over time?,medium,Manual evaluation needed
+34,How do the different student publications at Notre Dame serve different audiences?,medium,Manual evaluation needed
+35,Describe the evolution of student media at Notre Dame from 1876 to 2008,medium,Manual evaluation needed
+36,What role does student funding play in the independence of campus publications?,medium,Manual evaluation needed
+37,Compare the publication frequency and focus areas of The Scholastic versus The Observer,medium,Manual evaluation needed
+38,Explain how The Dome yearbook differs from other student publications in purpose,medium,Manual evaluation needed
+39,What are the key characteristics that define an independent student newspaper?,medium,Manual evaluation needed
+40,How has student journalism at Notre Dame adapted to changing media landscapes?,medium,Manual evaluation needed
+41,Analyze the editorial oversight structures across Notre Dame's student publications,medium,Manual evaluation needed
+42,What distinguishes The Juggler's content from other campus publications?,medium,Manual evaluation needed
+43,Describe the organizational structure and staffing model of The Observer,medium,Manual evaluation needed
+44,How do student publications balance university relations with editorial independence?,medium,Manual evaluation needed
+45,What trends can be identified in Notre Dame student media from the given information?,medium,Manual evaluation needed
+46,"Design a comprehensive strategy for a new university to establish a sustainable ecosystem of student publications that balances editorial independence, financial viability, diverse content coverage, and student engagement while learning from Notre Dame's 150-year history",complex,Requires multi-step analysis
+47,"Evaluate the trade-offs between faculty oversight and editorial independence in student publications, and recommend an optimal governance model for a modern university considering legal liability, educational value, press freedom, and institutional reputation",complex,Requires multi-step analysis
+48,"Analyze how the historical evolution of student media at Notre Dame reflects broader trends in American journalism, university administration, and student activism, then predict future challenges for campus publications",complex,Requires multi-step analysis
+49,"Develop a crisis management framework for an independent student newspaper facing declining print readership, controversial editorial content, university pressure, budget constraints, and competition from social media",complex,Requires multi-step analysis
+50,"Compare the role of student publications in shaping campus culture at Notre Dame versus a large public university, considering institutional mission, student diversity, funding models, and administrative relationships",complex,Requires multi-step analysis
