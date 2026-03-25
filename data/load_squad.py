@@ -63,3 +63,52 @@ for i in range(30):
 csv_file.close()
 print("✅ Created 30 simple queries")
 print("\n✅ Done! Check Google Drive")
+
+import csv
+
+csv_path = '/content/drive/MyDrive/cost-optimized-rag/data/queries/test_queries.csv'
+
+
+# Medium queries (15 total)
+medium_queries = [
+    "Compare the missions of different Notre Dame student publications mentioned in the document",
+    "Explain the relationship between The Observer's independence and its editorial content",
+    "What factors contributed to the shift in The Observer's political stance over time?",
+    "How do the different student publications at Notre Dame serve different audiences?",
+    "Describe the evolution of student media at Notre Dame from 1876 to 2008",
+    "What role does student funding play in the independence of campus publications?",
+    "Compare the publication frequency and focus areas of The Scholastic versus The Observer",
+    "Explain how The Dome yearbook differs from other student publications in purpose",
+    "What are the key characteristics that define an independent student newspaper?",
+    "How has student journalism at Notre Dame adapted to changing media landscapes?",
+    "Analyze the editorial oversight structures across Notre Dame's student publications",
+    "What distinguishes The Juggler's content from other campus publications?",
+    "Describe the organizational structure and staffing model of The Observer",
+    "How do student publications balance university relations with editorial independence?",
+    "What trends can be identified in Notre Dame student media from the given information?"
+]
+
+# Complex queries (5 total)
+complex_queries = [
+    "Design a comprehensive strategy for a new university to establish a sustainable ecosystem of student publications that balances editorial independence, financial viability, diverse content coverage, and student engagement while learning from Notre Dame's 150-year history",
+    "Evaluate the trade-offs between faculty oversight and editorial independence in student publications, and recommend an optimal governance model for a modern university considering legal liability, educational value, press freedom, and institutional reputation",
+    "Analyze how the historical evolution of student media at Notre Dame reflects broader trends in American journalism, university administration, and student activism, then predict future challenges for campus publications",
+    "Develop a crisis management framework for an independent student newspaper facing declining print readership, controversial editorial content, university pressure, budget constraints, and competition from social media",
+    "Compare the role of student publications in shaping campus culture at Notre Dame versus a large public university, considering institutional mission, student diversity, funding models, and administrative relationships"
+]
+
+# Append to existing CSV
+with open(csv_path, 'a', newline='') as f:
+    writer = csv.writer(f)
+
+    # Add 15 medium queries
+    for i, query in enumerate(medium_queries, start=31):
+        writer.writerow([i, query, 'medium', 'Manual evaluation needed'])
+
+    # Add 5 complex queries
+    for i, query in enumerate(complex_queries, start=46):
+        writer.writerow([i, query, 'complex', 'Requires multi-step analysis'])
+
+print("✅ Added 15 medium queries (31-45)")
+print("✅ Added 5 complex queries (46-50)")
+print("✅ Total: 50 queries (30 simple + 15 medium + 5 complex)")
