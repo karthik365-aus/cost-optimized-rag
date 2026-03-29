@@ -4,7 +4,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT))
 
-from src.retrieval.adaptive_retriever import AdaptiveRetriever
+from src.adaptive_retriever import AdaptiveRetriever
 from src.context_compression import ContextCompressor
 from src.model_router import ModelRouter
 
