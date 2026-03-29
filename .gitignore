@@ -4,3 +4,4 @@ chroma_db/
 .idea/
 __pycache__/
 *.pyc
+compression_results.csv

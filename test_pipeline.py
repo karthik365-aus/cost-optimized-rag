@@ -6,6 +6,7 @@ sys.path.append(str(PROJECT_ROOT))
 
 from src.retrieval.adaptive_retriever import AdaptiveRetriever
 from src.context_compression import ContextCompressor
+from src.model_router import ModelRouter
 
 
 def main():
@@ -32,6 +33,13 @@ def main():
     print("Original tokens:", result["original_token_count"])
     print("Compressed tokens:", result["compressed_token_count"])
     print("Compression ratio:", result["compression_ratio"])
+
+    router = ModelRouter()
+    router_result = router.route(query, complexity, result)
+
+    print("\n=== MODEL ROUTER OUTPUT ===")
+    print("Model used:", router_result["model_used"])
+    print("Answer:", router_result["answer"])
 
 
 if __name__ == "__main__":

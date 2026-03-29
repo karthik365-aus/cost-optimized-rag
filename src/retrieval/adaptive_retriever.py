@@ -16,7 +16,7 @@ class AdaptiveRetriever:
             loader_cls=TextLoader
         )
         documents = loader.load()
-        print(f"✅ Loaded {len(documents)} documents")
+        print(f"Loaded {len(documents)} documents")
         
         # Split into chunks
         text_splitter = RecursiveCharacterTextSplitter(
@@ -24,7 +24,7 @@ class AdaptiveRetriever:
             chunk_overlap=200
         )
         self.chunks = text_splitter.split_documents(documents)
-        print(f"✅ Created {len(self.chunks)} chunks")
+        print(f"Created {len(self.chunks)} chunks")
         
         # Create vector database (needs OpenAI API key or use local embeddings)
         # For now, we'll set this up in next step
@@ -40,7 +40,7 @@ class AdaptiveRetriever:
             embedding=embeddings,
             persist_directory="./chroma_db"
         )
-        print("✅ Vector database created")
+        print("Vector database created")
     
     def retrieve(self, query, complexity):
         """

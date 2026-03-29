@@ -7,6 +7,7 @@ sys.path.append(str(PROJECT_ROOT))
 
 from src.retrieval.adaptive_retriever import AdaptiveRetriever
 from src.context_compression import ContextCompressor
+from src.model_router import ModelRouter
 
 
 def main():
@@ -15,6 +16,7 @@ def main():
 
     retriever = AdaptiveRetriever(documents_path=documents_path)
     compressor = ContextCompressor()
+    router = ModelRouter()
 
     results = []
 
@@ -31,23 +33,35 @@ def main():
 
             docs = retriever.retrieve(query, complexity)
             result = compressor.compress(query, docs, complexity)
+            router_result = router.route(query, complexity, result)
 
             print("Original tokens:", result["original_token_count"])
             print("Compressed tokens:", result["compressed_token_count"])
             print("Compression ratio:", result["compression_ratio"])
+            print("Model used:", router_result["model_used"])
 
             results.append([
                 query,
                 complexity,
                 result["original_token_count"],
                 result["compressed_token_count"],
-                result["compression_ratio"]
+                result["compression_ratio"],
+                router_result["model_used"],
+                router_result["answer"],
             ])
 
     output_file = PROJECT_ROOT / "compression_results.csv"
     with open(output_file, "w", newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["query", "complexity", "original_tokens", "compressed_tokens", "compression_ratio"])
+        writer.writerow([
+            "query",
+            "complexity",
+            "original_tokens",
+            "compressed_tokens",
+            "compression_ratio",
+            "model_used",
+            "answer",
+        ])
         writer.writerows(results)
 
     print("\nResults saved to compression_results.csv")
