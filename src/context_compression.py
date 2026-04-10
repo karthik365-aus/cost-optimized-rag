@@ -1,8 +1,11 @@
 import re
 from typing import List, Dict, Any
 
+import tiktoken
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+_TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
 
 class ContextCompressor:
@@ -108,4 +111,4 @@ class ContextCompressor:
         return ranked
 
     def _count_tokens(self, text: str) -> int:
-        return len(text.split())
+        return len(_TOKENIZER.encode(text))
