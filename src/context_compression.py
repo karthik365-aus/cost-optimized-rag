@@ -25,6 +25,9 @@ class ContextCompressor:
             return {
                 "compressed_context": "",
                 "selected_sentences": [],
+                "all_sentences": [],
+                "sentence_scores": [],
+                "selected_indices": [],
                 "original_text": "",
                 "original_token_count": 0,
                 "compressed_token_count": 0,
@@ -39,6 +42,9 @@ class ContextCompressor:
             return {
                 "compressed_context": original_text,
                 "selected_sentences": [],
+                "all_sentences": [],
+                "sentence_scores": [],
+                "selected_indices": [],
                 "original_text": original_text,
                 "original_token_count": original_tokens,
                 "compressed_token_count": original_tokens,
@@ -49,6 +55,10 @@ class ContextCompressor:
         top_n = self.max_sentences_map.get(complexity, 4)
         selected_sentences = [s for s, _ in ranked_sentences[:top_n]]
 
+        # Map selected sentences back to their original indices and scores
+        sentence_scores = [{"sentence": s, "tfidf_score": round(float(score), 4)} for s, score in ranked_sentences]
+        selected_indices = [sentences.index(s) for s in selected_sentences if s in sentences]
+
         compressed_context = " ".join(selected_sentences).strip()
 
         original_tokens = self._count_tokens(original_text)
@@ -58,6 +68,9 @@ class ContextCompressor:
         return {
             "compressed_context": compressed_context,
             "selected_sentences": selected_sentences,
+            "all_sentences": sentences,
+            "sentence_scores": sentence_scores,
+            "selected_indices": selected_indices,
             "original_text": original_text,
             "original_token_count": original_tokens,
             "compressed_token_count": compressed_tokens,

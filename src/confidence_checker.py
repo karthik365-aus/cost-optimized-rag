@@ -153,12 +153,24 @@ def check_confidence(
     confidence_score_original = round(0.7 * semantic_score + 0.3 * heuristic, 2)
 
     retried = False
+    retry_reason = None
     model_used_final = model_used_original
     confidence_score_final = confidence_score_original
 
     # Step 4 — retry if low confidence
     if confidence_score_final < CONFIDENCE_THRESHOLD and model_used_original in MODEL_TIERS:
         retried = True
+        low_scores = []
+        if heuristic < CONFIDENCE_THRESHOLD:
+            low_scores.append(f"heuristic={heuristic}")
+        if tfidf < CONFIDENCE_THRESHOLD:
+            low_scores.append(f"tfidf={tfidf}")
+        if embed < CONFIDENCE_THRESHOLD:
+            low_scores.append(f"embedding={embed}")
+        retry_reason = f"confidence {confidence_score_original} < threshold {CONFIDENCE_THRESHOLD}" + (
+            f" (low: {', '.join(low_scores)})" if low_scores else ""
+        )
+
         stronger_model = MODEL_TIERS[model_used_original]
         try:
             new_answer = retry_with_stronger_model(
@@ -189,4 +201,11 @@ def check_confidence(
         "confidence_score_original": confidence_score_original,
         "confidence_score_final": confidence_score_final,
         "retried": retried,
+        "retry_reason": retry_reason,
+        "score_breakdown": {
+            "heuristic": heuristic,
+            "tfidf": tfidf,
+            "embedding": embed,
+            "semantic": round(0.5 * tfidf + 0.5 * embed, 4),
+        },
     }

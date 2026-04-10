@@ -1,8 +1,12 @@
+import time
 from typing import Any, Dict, Optional
 
+import tiktoken
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+
+_TOKENIZER = tiktoken.get_encoding("cl100k_base")
 
 
 class ModelRouter:
@@ -48,16 +52,31 @@ class ModelRouter:
                 "answer": "I could not find enough context to answer the question.",
                 "model_used": model_used,
                 "complexity": normalized_complexity,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "time_taken_seconds": 0.0,
             }
 
         llm = ChatOpenAI(model=model_used, temperature=self.temperature)
         messages = self._build_messages(query, compressed_context)
+
+        input_text = query + "\n\n" + compressed_context
+        input_tokens = len(_TOKENIZER.encode(input_text))
+
+        start = time.time()
         response = llm.invoke(messages)
+        elapsed = round(time.time() - start, 3)
+
+        answer = self._extract_text(response)
+        output_tokens = len(_TOKENIZER.encode(answer))
 
         return {
-            "answer": self._extract_text(response),
+            "answer": answer,
             "model_used": model_used,
             "complexity": normalized_complexity,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "time_taken_seconds": elapsed,
         }
 
     def _build_messages(self, query: str, compressed_context: str):

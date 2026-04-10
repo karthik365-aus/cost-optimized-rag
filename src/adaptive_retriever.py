@@ -47,7 +47,7 @@ class AdaptiveRetriever:
             )
             print("Vector database created")
 
-    def retrieve(self, query: str, complexity: str):
+    def retrieve(self, query: str, complexity: str) -> dict:
         k_map = {
             'simple': 3,
             'medium': 5,
@@ -55,4 +55,21 @@ class AdaptiveRetriever:
         }
         k = k_map.get(complexity, 5)
         print(f"Retrieving {k} chunks for {complexity} query...")
-        return self.vectordb.similarity_search(query, k=k)
+
+        results = self.vectordb.similarity_search_with_score(query, k=k)
+
+        docs = []
+        chunks_metadata = []
+        for i, (doc, score) in enumerate(results):
+            docs.append(doc)
+            chunks_metadata.append({
+                "chunk_index": i,
+                "source": doc.metadata.get("source", "unknown"),
+                "similarity_score": round(float(score), 4),
+            })
+
+        return {
+            "docs": docs,
+            "k": k,
+            "chunks": chunks_metadata,
+        }
