@@ -1,6 +1,5 @@
 # src/confidence_checker.py
 
-import os
 from typing import Dict, Any
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -9,7 +8,7 @@ from langchain_openai import ChatOpenAI
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-import openai
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -17,7 +16,8 @@ load_dotenv()
 # CONFIG
 # -----------------------------
 CONFIDENCE_THRESHOLD = 0.65
-EMBEDDING_MODEL = "text-embedding-3-small"
+
+_EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
 MODEL_TIERS = {
     "gpt-3.5-turbo": "gpt-4o-mini",
@@ -75,16 +75,8 @@ def embedding_similarity(answer: str, context: str) -> float:
     if not answer.strip() or not context.strip():
         return 0.0
     try:
-        emb_answer_resp = openai.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=answer
-        )
-        emb_context_resp = openai.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=context
-        )
-        emb_answer = np.array(emb_answer_resp.data[0].embedding).reshape(1, -1)
-        emb_context = np.array(emb_context_resp.data[0].embedding).reshape(1, -1)
+        emb_answer = _EMBEDDING_MODEL.encode(answer, convert_to_numpy=True).reshape(1, -1)
+        emb_context = _EMBEDDING_MODEL.encode(context, convert_to_numpy=True).reshape(1, -1)
         score = cosine_similarity(emb_answer, emb_context)[0][0]
         return float(np.clip(score, 0.0, 1.0))
     except Exception as e:

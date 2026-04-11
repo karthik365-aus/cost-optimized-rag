@@ -6,3 +6,4 @@ chromadb
 python-dotenv
 tiktoken
 scikit-learn
+sentence-transformers
