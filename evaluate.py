@@ -7,6 +7,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 sys.path.append(str(PROJECT_ROOT))
 
 from pipeline import RAGPipeline
+from src.seed_manager import set_all_seeds
 
 
 # -----------------------------
@@ -221,4 +222,5 @@ def run_evaluation(queries_file: str = None, output_csv: str = None, output_json
 
 
 if __name__ == "__main__":
+    set_all_seeds(42)
     run_evaluation()

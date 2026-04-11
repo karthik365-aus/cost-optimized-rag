@@ -9,6 +9,7 @@ from src.adaptive_retriever import AdaptiveRetriever
 from src.context_compression import ContextCompressor
 from src.model_router import ModelRouter
 from src.confidence_checker import check_confidence
+from src.seed_manager import set_all_seeds
 
 
 class RAGPipeline:
@@ -88,6 +89,7 @@ class RAGPipeline:
 
 
 if __name__ == "__main__":
+    set_all_seeds(42)
     pipeline = RAGPipeline()
 
     test_queries = [
