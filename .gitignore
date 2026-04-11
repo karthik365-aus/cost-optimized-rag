@@ -6,3 +6,4 @@ __pycache__/
 *.pyc
 compression_results.csv
 evaluation_results.csv
+evaluation_results.json
