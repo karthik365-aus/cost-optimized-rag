@@ -25,13 +25,24 @@ class RAGPipeline:
 
         # Step 1 — Classify query complexity
         analysis = self.analyzer.analyze(query)
-        complexity = analysis["complexity"]
-        print(f"Complexity: {complexity}")
+        complexity = analysis["complexity_label"]
+        print(
+            f"Complexity: {complexity} "
+            f"(confidence={analysis['confidence']}, source={analysis['source']}, llm_status={analysis['llm_status']})"
+        )
 
         # Step 2 — Retrieve relevant chunks
-        retrieval = self.retriever.retrieve(query, complexity)
+        retrieval = self.retriever.retrieve(
+            query=query,
+            complexity=complexity,
+            complexity_score=analysis.get("complexity_score"),
+            analyzer_confidence=analysis.get("confidence"),
+        )
         docs = retrieval["docs"]
-        print(f"Retrieved {retrieval['k']} chunks:")
+        print(
+            f"Retrieved {retrieval['k']} chunks "
+            f"(k_base={retrieval['k_base']}, coverage={retrieval['coverage_score']}, retry={retrieval['retrieval_retry']}):"
+        )
         for c in retrieval["chunks"]:
             print(f"  [{c['chunk_index']}] {c['source']} (score: {c['similarity_score']})")
 
@@ -50,6 +61,7 @@ class RAGPipeline:
             query=query,
             compressed_context=compression["compressed_context"],
             router_output=router_result,
+            analyzer_output=analysis,
         )
         breakdown = confidence_result["score_breakdown"]
         print(f"Score breakdown — heuristic: {breakdown['heuristic']} | tfidf: {breakdown['tfidf']} | embedding: {breakdown['embedding']} | semantic: {breakdown['semantic']}")
@@ -60,8 +72,20 @@ class RAGPipeline:
         return {
             "query": query,
             "complexity": complexity,
+            "complexity_source": analysis["source"],
+            "complexity_score": analysis.get("complexity_score"),
+            "complexity_confidence": analysis["confidence"],
+            "complexity_reason_codes": analysis["reason_codes"],
+            "query_analyzer_llm_status": analysis["llm_status"],
             # retrieval metadata
             "k": retrieval["k"],
+            "retrieval_complexity_used": retrieval["complexity_used"],
+            "retrieval_complexity_score_used": retrieval["complexity_score_used"],
+            "retrieval_analyzer_confidence": retrieval["analyzer_confidence"],
+            "k_base": retrieval["k_base"],
+            "k_final": retrieval["k_final"],
+            "coverage_score": retrieval["coverage_score"],
+            "retrieval_retry": retrieval["retrieval_retry"],
             "chunks": retrieval["chunks"],
             # compression metadata
             "compressed_context": compression["compressed_context"],

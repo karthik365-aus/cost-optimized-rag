@@ -114,6 +114,11 @@ def run_evaluation(queries_file: str = None, output_csv: str = None, output_json
                 "query_id": query_id,
                 "query": query,
                 "complexity": complexity,
+                "complexity_routed": result["complexity"],
+                "complexity_score": result.get("complexity_score", ""),
+                "complexity_source": result.get("complexity_source", ""),
+                "complexity_confidence": result.get("complexity_confidence", ""),
+                "query_analyzer_llm_status": result.get("query_analyzer_llm_status", ""),
                 "ground_truth": ground_truth,
                 "ground_truth_source": ground_truth_source,
                 "answer_correct": "" if correct is None else ("yes" if correct else "no"),
@@ -127,6 +132,12 @@ def run_evaluation(queries_file: str = None, output_csv: str = None, output_json
                     else "n/a"
                 ),
                 "k": result["k"],
+                "k_base": result.get("k_base", ""),
+                "k_final": result.get("k_final", ""),
+                "retrieval_complexity_score_used": result.get("retrieval_complexity_score_used", ""),
+                "retrieval_analyzer_confidence": result.get("retrieval_analyzer_confidence", ""),
+                "coverage_score": result.get("coverage_score", ""),
+                "retrieval_retry": result.get("retrieval_retry", False),
                 "original_tokens": result["original_token_count"],
                 "compressed_tokens": result["compressed_token_count"],
                 "compression_ratio": result["compression_ratio"],
@@ -178,6 +189,15 @@ def run_evaluation(queries_file: str = None, output_csv: str = None, output_json
     retrieval_correct = sum(1 for r in retrieval_evaluatable if r["retrieval_hit"] == "yes")
 
     retried_count = sum(1 for r in rows if str(r["retried"]).lower() == "true")
+    flan_invocations = sum(1 for r in rows if r["query_analyzer_llm_status"] != "not_called")
+    flan_timeouts = sum(1 for r in rows if r["query_analyzer_llm_status"] == "timeout")
+    flan_errors = sum(1 for r in rows if r["query_analyzer_llm_status"] in ("runtime_error", "parse_error"))
+    retrieval_retries = sum(1 for r in rows if str(r.get("retrieval_retry")).lower() == "true")
+    avg_coverage = round(
+        sum(float(r["coverage_score"]) for r in rows if str(r["coverage_score"]) != "")
+        / max(1, sum(1 for r in rows if str(r["coverage_score"]) != "")),
+        4,
+    )
     avg_compression = round(sum(float(r["compression_ratio"]) for r in rows) / len(rows), 4)
     avg_confidence = round(sum(float(r["confidence_final"]) for r in rows) / len(rows), 4)
 
@@ -214,6 +234,11 @@ def run_evaluation(queries_file: str = None, output_csv: str = None, output_json
 
     print(f"\nOTHER METRICS:")
     print(f"  Queries retried         : {retried_count}/{len(rows)}")
+    print(f"  FLAN invocations        : {flan_invocations}/{len(rows)}")
+    print(f"  FLAN timeouts           : {flan_timeouts}")
+    print(f"  FLAN errors             : {flan_errors}")
+    print(f"  Retrieval retries       : {retrieval_retries}/{len(rows)}")
+    print(f"  Avg coverage score      : {avg_coverage}")
     print(f"  Avg compression ratio   : {avg_compression}")
     print(f"  Avg confidence score    : {avg_confidence}")
     print(f"\nResults saved to:")
