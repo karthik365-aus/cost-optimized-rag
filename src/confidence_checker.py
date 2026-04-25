@@ -1,14 +1,22 @@
-# src/confidence_checker.py
+"""
+Post-generation grounding check: scores the **answer against the compressed context**
+(not against CSV ground truth). Combines heuristic overlap, TF-IDF, and optional
+BGE sentence similarity; if aggregate confidence is below ``CONFIDENCE_THRESHOLD`` and
+the model maps in ``MODEL_TIERS``, may retry once with a stronger OpenAI model.
 
+``MODEL_TIERS`` keys are **OpenAI-style** model names (e.g. ``gpt-3.5-turbo``). If the
+router used a **local** LM Studio id, the name will not match and **no tier retry** runs;
+only scores are returned. Extend ``MODEL_TIERS`` deliberately if you need local retries.
+"""
 from typing import Dict, Any
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
+from src.shared_embeddings import get_embedding_model
 
 import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -17,8 +25,25 @@ load_dotenv()
 # -----------------------------
 CONFIDENCE_THRESHOLD = 0.65
 
-_EMBEDDING_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+_EMBEDDING_MODEL = None
+_EMBEDDING_LOAD_ATTEMPTED = False
+_EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 
+
+def _get_embedding_model():
+    """Lazy load so a missing ``sentence_transformers`` install does not break import."""
+    global _EMBEDDING_MODEL, _EMBEDDING_LOAD_ATTEMPTED
+    if _EMBEDDING_LOAD_ATTEMPTED:
+        return _EMBEDDING_MODEL
+    _EMBEDDING_LOAD_ATTEMPTED = True
+    try:
+        _EMBEDDING_MODEL = get_embedding_model(_EMBEDDING_MODEL_NAME)
+    except Exception as e:
+        print(f"[ConfidenceChecker] Embedding model unavailable, continuing without it: {e}")
+        _EMBEDDING_MODEL = None
+    return _EMBEDDING_MODEL
+
+# NOTE: Keys must match router `model_used` exactly; local LM Studio ids usually will not match these OpenAI-style names.
 MODEL_TIERS = {
     "gpt-3.5-turbo": "gpt-4o-mini",
     "gpt-4o-mini": "gpt-4o",
@@ -74,9 +99,12 @@ def tfidf_similarity(answer: str, context: str) -> float:
 def embedding_similarity(answer: str, context: str) -> float:
     if not answer.strip() or not context.strip():
         return 0.0
+    model = _get_embedding_model()
+    if model is None:
+        return 0.0
     try:
-        emb_answer = _EMBEDDING_MODEL.encode(answer, convert_to_numpy=True).reshape(1, -1)
-        emb_context = _EMBEDDING_MODEL.encode(context, convert_to_numpy=True).reshape(1, -1)
+        emb_answer = model.encode(answer, convert_to_numpy=True).reshape(1, -1)
+        emb_context = model.encode(context, convert_to_numpy=True).reshape(1, -1)
         score = cosine_similarity(emb_answer, emb_context)[0][0]
         return float(np.clip(score, 0.0, 1.0))
     except Exception as e:
@@ -123,11 +151,17 @@ def check_confidence(
     query: str,
     compressed_context: str,
     router_output: Dict[str, Any],
+    analyzer_output: Dict[str, Any] = None,
 ) -> Dict[str, Any]:
+    """Return final answer (possibly retried), confidence scores, and metadata for logging."""
+
+    _get_embedding_model()
 
     answer = router_output.get("answer", "")
     model_used_original = router_output.get("model_used", "")
     complexity = router_output.get("complexity", "medium")
+    analyzer_confidence = (analyzer_output or {}).get("confidence")
+    analyzer_source = (analyzer_output or {}).get("source")
 
     # Step 1 — heuristic score
     heuristic = heuristic_score(answer, compressed_context)
@@ -186,6 +220,7 @@ def check_confidence(
         except Exception as e:
             print(f"[ConfidenceChecker] Retry failed: {e}")
 
+    semantic = round(0.5 * tfidf + 0.5 * embed, 4)
     return {
         "final_answer": answer,
         "model_used_original": model_used_original,
@@ -194,10 +229,16 @@ def check_confidence(
         "confidence_score_final": confidence_score_final,
         "retried": retried,
         "retry_reason": retry_reason,
+        "analyzer_confidence": analyzer_confidence,
+        "analyzer_source": analyzer_source,
+        "answer_complexity": complexity,
+        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "confidence_checker_embedding_enabled": _EMBEDDING_MODEL is not None,
+        "confidence_semantic": semantic,
         "score_breakdown": {
             "heuristic": heuristic,
             "tfidf": tfidf,
             "embedding": embed,
-            "semantic": round(0.5 * tfidf + 0.5 * embed, 4),
+            "semantic": semantic,
         },
     }

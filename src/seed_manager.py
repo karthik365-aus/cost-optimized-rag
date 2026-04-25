@@ -1,3 +1,4 @@
+"""Central place to fix random seeds (Python, NumPy, optional PyTorch) for reproducible runs."""
 import random
 import numpy as np
 

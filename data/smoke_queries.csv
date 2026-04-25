@@ -1,0 +1,11 @@
+query_id,query,complexity,ground_truth,ground_truth_source
+0,"To whom did the Virgin Mary allegedly appear in 1858 in Lourdes France?",simple,"Saint Bernadette Soubirous",doc_00.txt
+1,"What is in front of the Notre Dame Main Building?",simple,"a copper statue of Christ",doc_00.txt
+2,"The Basilica of the Sacred heart at Notre Dame is beside to which structure?",simple,"a copper statue of Christ",doc_00.txt
+3,"What is the Grotto at Notre Dame?",simple,"a Marian place of prayer and reflection",doc_00.txt
+4,"What sits on top of the Main Building at Notre Dame?",simple,"a golden statue of the Virgin Mary",doc_00.txt
+5,"When did the Scholastic Magazine of Notre dame begin publishing?",simple,"September 1876",doc_01.txt
+6,"How often is Notre Dame's the Juggler published?",simple,"twice",doc_01.txt
+7,"What is the daily student paper at Notre Dame called?",simple,"The Observer",doc_01.txt
+8,"How many student news papers are found at Notre Dame?",simple,"three",doc_01.txt
+9,"In what year did the student paper Common Sense begin publication at Notre Dame?",simple,"1987",doc_01.txt

@@ -11,13 +11,15 @@ A cost-optimized Retrieval Augmented Generation (RAG) pipeline that classifies q
 ```
 User Query
     ↓
-[DONE] Adaptive Retrieval   → retrieves 3/5/10 relevant chunks from ChromaDB
+[DONE] Query analyzer       → complexity label + score (+ optional FLAN)
     ↓
-[DONE] Context Compression  → compresses chunks to top 2/4/6 sentences
+[DONE] Adaptive retrieval   → Chroma + dynamic k / coverage retry
     ↓
-[TODO] Model Router         → routes to cheap/mid/powerful LLM based on complexity
+[DONE] Context compression   → hybrid TF-IDF / embeddings, adaptive budget
     ↓
-[TODO] Confidence Checker   → validates response quality, retries if needed
+[DONE] Model router          → simple/medium → local OpenAI-compatible API; complex → OpenAI
+    ↓
+[DONE] Confidence checker    → answer vs compressed context; OpenAI tier retry (see MODEL_TIERS note in README)
     ↓
 Final Answer
 ```
@@ -30,22 +32,24 @@ Final Answer
 cost-optimized-rag/
 │
 ├── src/
-│   ├── retrieval/
-│   │   └── adaptive_retriever.py     ✅ DONE (Karthik) — vector search, returns chunks
-│   ├── context_compression.py        ✅ DONE (Anh)     — compresses chunks to key sentences
-│   ├── model_router.py               🔲 TODO (assign)  — pick LLM based on complexity
-│   ├── confidence_checker.py         🔲 TODO (assign)  — validate and retry LLM response
-│   ├── query_analyzer.py             🔲 TODO           — classify query complexity
-│   └── adaptive_retrieval.py         🔲 TODO           — orchestrates full pipeline
+│   ├── adaptive_retriever.py         ✅ Chroma + BGE embeddings
+│   ├── context_compression.py        ✅ sentence selection / hybrid scoring
+│   ├── model_router.py               ✅ local OpenAI-compatible + OpenAI complex
+│   ├── confidence_checker.py         ✅ grounding score; tier retry for OpenAI model names
+│   ├── query_analyzer.py             ✅ complexity heuristics + optional FLAN
+│   ├── pipeline.py                   ✅ end-to-end orchestration
+│   ├── preflight.py                  ✅ CSV / Chroma / local models checks for evaluate
+│   └── seed_manager.py               ✅ reproducible seeds
 │
 ├── data/
-│   ├── documents/                    ✅ source text files (Notre Dame dataset)
-│   └── test_queries.csv              ✅ 50 test queries (simple/medium/complex)
+│   ├── documents/                    ✅ source `.txt` files for ingestion
+│   └── test_queries.csv              ✅ benchmark queries + ground truth
 │
-├── test_pipeline.py                  ✅ run this to test retrieval + compression together
-├── run_all_queries.py                ✅ run this to evaluate all 50 queries, saves results to CSV
-├── requirements.txt                  ✅ all dependencies
-└── .env                              ⚠️  NOT on GitHub — you must create this yourself (see below)
+├── evaluate.py                       ✅ full pipeline benchmark → CSV + JSON (+ CLI)
+├── scripts/run_eval.sh               ✅ run evaluate.py from repo root
+├── chroma_db/                        (generated) vector index under project root
+├── requirements.txt
+└── .env                              ⚠️  NOT on GitHub — create from `.env.example`
 ```
 
 ---
@@ -71,16 +75,18 @@ pip install -r requirements.txt
 ```
 
 ### 4. Create your .env file
-Create a file called `.env` in the project root (this is NOT on GitHub for security):
-```
-OPENAI_API_KEY=your_openai_api_key_here
+Create `.env` in the project root (not on GitHub). Start from `.env.example`: OpenAI key for **complex** queries, `LOCAL_OPENAI_*` and exact local model IDs for **simple/medium**, optional compression and `EVAL_GT_EMBEDDING_MODEL` vars.
+
+### 5. Run evaluation (full pipeline + benchmark metrics)
+From the project root, with LM Studio (or your local server) running if you use local models:
+
+```bash
+python evaluate.py --help
+python evaluate.py
+# or: ./scripts/run_eval.sh --seed 7 -v
 ```
 
-### 5. Test the pipeline works
-```bash
-python test_pipeline.py
-```
-You should see retrieved chunks and a compressed context printed in the terminal.
+Preflight validates the CSV, Chroma or document paths, and (by default) local `/v1/models`. See root **README.md** for flags (`--no-preflight`, `--skip-local-model-check`, outputs, logging).
 
 ---
 
@@ -115,25 +121,20 @@ git push
 ```
 Plus: `query` (string) and `complexity` (`"simple"` / `"medium"` / `"complex"`)
 
-**Your job:** Pick the right LLM model based on complexity and return the answer.
+**Your job:** Map complexity to a model. **Current implementation (see `.env.example`):**  
+`simple` / `medium` → **local** OpenAI-compatible server (e.g. LM Studio) using `LOCAL_SIMPLE_MODEL` / `LOCAL_MEDIUM_MODEL` from `/v1/models`; `complex` → **OpenAI** via `OPENAI_COMPLEX_MODEL` and `OPENAI_API_KEY`.
 
-```python
-# Model mapping (suggested)
-simple   → gpt-3.5-turbo    (cheap, fast)
-medium   → gpt-4o-mini      (balanced)
-complex  → gpt-4o           (powerful)
-```
-
-**Your output** should be a dict like:
+**Your output** is a dict like (see `src/model_router.py` for full fields):
 ```python
 {
     "answer": "The answer text...",
-    "model_used": "gpt-3.5-turbo",
+    "model_used": "<id from env>",
+    "model_source": "local_openai_compatible" or "openai",
     "complexity": "simple"
 }
 ```
 
-**Reference:** Look at `test_pipeline.py` to see how retrieval and compression connect — your module plugs in right after compression.
+**Reference:** `src/pipeline.py` calls the router right after `ContextCompressor.compress()`. For an end-to-end test, run `python evaluate.py` from the project root.
 
 ---
 
@@ -151,15 +152,7 @@ complex  → gpt-4o           (powerful)
 ```
 Plus: the original `query` and `compressed_context`
 
-**Your job:** Score the answer quality. If confidence is low, retry with a stronger model.
-
-```python
-# Suggested logic
-if confidence_score < threshold:
-    retry with next tier model (e.g. gpt-3.5 → gpt-4o-mini)
-else:
-    return final answer
-```
+**Your job:** Score the answer **against the compressed context** (grounding). If confidence is low, `MODEL_TIERS` can trigger a one-step retry to a **stronger OpenAI** model when `model_used` matches a tier key. **Local LM Studio model ids do not match those keys, so retry usually does not run for local calls** (scores are still returned).
 
 **Your output** should be:
 ```python
@@ -177,8 +170,9 @@ else:
 
 | Command | What it does |
 |---|---|
-| `python test_pipeline.py` | Tests 1 query through retrieval + compression |
-| `python run_all_queries.py` | Tests all 50 queries, saves to `compression_results.csv` |
+| `python evaluate.py` | Runs every row in `data/test_queries.csv` through `RAGPipeline`; writes `evaluation_results.{csv,json}` (override with `--out-csv` / `--out-json`) |
+| `python evaluate.py --queries path/to.csv --seed 7` | Custom benchmark file and seed |
+| `./scripts/run_eval.sh …` | Same as `python evaluate.py …` from repo root |
 
 ---
 
@@ -188,3 +182,15 @@ else:
 - Always `git pull` before starting work
 - Only add your own files when doing `git add` — don't use `git add .`
 - If you get a merge conflict, ask the team before force pushing
+
+---
+
+## Recent updates (Apr 24, 2026 — appended)
+
+- **End-to-end run:** Use **`python evaluate.py`** from the project root (or **`scripts/run_eval.sh`**). **`evaluate.py`** loads **`.env` before preflight** so LM Studio model IDs are picked up; it also **creates output directories** for custom `--out-csv` / `--out-json` paths.
+- **Compression ↔ retrieval:** **`coverage_score`** from retrieval is fed into **`context_compression`** to adjust how many sentences are kept when keyword overlap with retrieved text is weak.
+- **Retrieval JSON fields:** Prefer **`chroma_distance`** for chunk ranking diagnostics (**lower = closer**); **`similarity_score`** is a legacy alias for the same raw value.
+- **Confidence checker:** Scores answer vs **compressed context**, not CSV ground truth; **`MODEL_TIERS`** retry targets **OpenAI-style** model names — **local LM Studio ids usually won’t trigger** a tier retry (documented in code + README).
+- **Query analyzer:** FLAN override threshold follows **`QUERY_ANALYZER_HIGH_CONF_THRESHOLD`** (env), not a hardcoded mid value — check **`.env.example`** / README if behavior feels “stricter” on FLAN adoption.
+- **Model router:** No per-complexity temperature or prompt-template fork in code right now (a Phase-2 variant was **reverted**); single prompt + default temperature **0.0** unless you change **`ModelRouter`** construction in code.
+- **Git hygiene:** **`.gitignore`** now ignores **`results/`**, **`.hf_cache/`**, **`venv/`**, Office temp **`~$*`** and **`*.docx`** — still review `git status` before push.

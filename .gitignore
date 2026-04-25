@@ -1,9 +1,14 @@
 .env
 chroma_db/
+.hf_cache/
+results/
+venv/
 .DS_Store
 .idea/
 __pycache__/
 *.pyc
+*.docx
+~$*
 compression_results.csv
 evaluation_results.csv
 evaluation_results.json

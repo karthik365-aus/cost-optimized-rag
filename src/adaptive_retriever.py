@@ -1,3 +1,10 @@
+"""
+Vector retrieval over ``chroma_db`` using ``HuggingFaceEmbeddings`` (default BGE small).
+
+``retrieve`` chooses k from query complexity score, may bump k when analyzer confidence is low,
+re-runs once if keyword *coverage* of the query vs retrieved text is below a label-specific
+threshold (when analyzer confidence passes a gate). Returns docs + rich metadata for logging.
+"""
 from pathlib import Path
 import re
 from typing import List, Tuple
@@ -10,11 +17,17 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 load_dotenv()
 
-CHROMA_DIR = "./chroma_db"
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CHROMA_DIR = str(_PROJECT_ROOT / "chroma_db")
 EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"
 
 
 class AdaptiveRetriever:
+    K_BASE_MIN = 3
+    K_BASE_MAX = 10
+    K_HARD_CAP = 10
+    LOW_CONF_BONUS = 2
+    RETRY_BONUS = 1
     STOPWORDS = {
         "the", "a", "an", "is", "are", "was", "were", "be", "to", "of", "and",
         "or", "for", "in", "on", "at", "with", "by", "from", "that", "this",
@@ -33,7 +46,7 @@ class AdaptiveRetriever:
             encode_kwargs={"normalize_embeddings": True},
         )
 
-        if Path(CHROMA_DIR).exists():
+        if Path(CHROMA_DIR).is_dir():
             print("Loading existing vector database...")
             self.vectordb = Chroma(
                 persist_directory=CHROMA_DIR,
@@ -72,20 +85,15 @@ class AdaptiveRetriever:
         complexity_score: float = None,
         analyzer_confidence: float = None,
     ) -> dict:
-        k_map = {
-            'simple': 3,
-            'medium': 5,
-            'complex': 10
-        }
         normalized_complexity = (complexity or "medium").strip().lower()
         fallback_score_map = {'simple': 0.2, 'medium': 0.55, 'complex': 0.85}
         score = complexity_score if complexity_score is not None else fallback_score_map.get(normalized_complexity, 0.55)
         score = max(0.0, min(1.0, float(score)))
 
-        # Score-first retrieval size, equivalent to linear map in range [3,10].
-        k_base = max(3, min(10, round(3 + score * 7)))
+        # Score-first retrieval size: k = 3 + complexity_score * 7 with single hard cap.
+        k_base = max(self.K_BASE_MIN, min(self.K_BASE_MAX, round(3 + score * 7)))
         low_confidence = analyzer_confidence is not None and float(analyzer_confidence) < 0.70
-        k_final = min(k_base + 2, 12) if low_confidence else k_base
+        k_final = min(k_base + self.LOW_CONF_BONUS, self.K_HARD_CAP) if low_confidence else k_base
         print(
             f"Retrieving {k_final} chunks for {normalized_complexity} query "
             f"(score={round(score, 2)}, confidence={analyzer_confidence})..."
@@ -95,10 +103,10 @@ class AdaptiveRetriever:
         coverage_score = self._keyword_coverage_score(query=query, docs=docs)
         retrieval_retry = False
         coverage_threshold = self.COVERAGE_THRESHOLDS.get(normalized_complexity, 0.50)
-        confidence_for_retry = analyzer_confidence is None or float(analyzer_confidence) < self.RETRY_CONFIDENCE_GATE
+        low_confidence_for_retry = analyzer_confidence is None or float(analyzer_confidence) < self.RETRY_CONFIDENCE_GATE
 
-        if coverage_score < coverage_threshold and confidence_for_retry and k_final < 12:
-            retry_k = min(k_final + 1, 12)
+        if coverage_score < coverage_threshold and low_confidence_for_retry and k_final < self.K_HARD_CAP:
+            retry_k = min(k_final + self.RETRY_BONUS, self.K_HARD_CAP)
             docs, chunks_metadata = self._run_retrieval(query=query, k=retry_k)
             k_final = retry_k
             coverage_score = self._keyword_coverage_score(query=query, docs=docs)
@@ -128,10 +136,13 @@ class AdaptiveRetriever:
         chunks_metadata = []
         for i, (doc, score) in enumerate(results):
             docs.append(doc)
+            d = round(float(score), 4)
             chunks_metadata.append({
                 "chunk_index": i,
                 "source": doc.metadata.get("source", "unknown"),
-                "similarity_score": round(float(score), 4),
+                # Chroma / LangChain: distance in embedding space; LOWER = closer to query
+                "chroma_distance": d,
+                "similarity_score": d,
             })
         return docs, chunks_metadata
 

@@ -48,7 +48,7 @@ These are propagated into pipeline/evaluation outputs for analysis.
 ## File Changes
 - `src/adaptive_retriever.py`
   - Added score-first `k`, quality check, retry policy, richer metadata.
-- `pipeline.py`
+- `src/pipeline.py`
   - Passes analyzer score/confidence into retriever and returns new retrieval fields.
 - `evaluate.py`
   - Logs new retriever metrics into CSV/JSON and prints summary stats.
