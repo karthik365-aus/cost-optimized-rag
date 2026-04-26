@@ -29,6 +29,21 @@ Verify local model IDs:
 curl -s http://127.0.0.1:1234/v1/models | python3 -m json.tool
 ```
 
+## For Teammates: 60-second Run Checklist
+
+1. Clone/download the full repo (not a single file).
+2. `pip install -r requirements.txt`
+3. `cp .env.example .env` and set:
+   - `OPENAI_API_KEY`
+   - `LOCAL_OPENAI_BASE_URL` (with `/v1`)
+   - `LOCAL_SIMPLE_MODEL`
+   - `LOCAL_MEDIUM_MODEL`
+4. Start LM Studio local server and load local model(s).
+5. Run smoke test:
+   - `python evaluate.py --queries data/smoke_queries.csv --out-csv results/smoke.csv --out-json results/smoke.json`
+6. If smoke passes, run full benchmark:
+   - `python evaluate.py --out-csv results/eval.csv --out-json results/eval.json`
+
 ## What This Pipeline Does
 
 - `src/query_analyzer.py`: predicts `complexity_label`, `complexity_score`, `confidence`
@@ -104,6 +119,7 @@ Useful columns to inspect first:
 - If CSV contains any `complex` rows and `OPENAI_API_KEY` is missing, preflight fails fast.
 - Retriever score is stored as `chroma_distance` (distance, lower is better); legacy `similarity_score` may still appear for compatibility.
 - Confidence retry uses `MODEL_TIERS` and only applies when model names match those keys (local LM Studio IDs usually do not match).
+- Pipeline now applies **general typo-tolerant query normalization** (corpus-driven fuzzy correction), then may run a stronger fallback retrieval pass when answer quality is low.
 
 ## Troubleshooting
 
@@ -115,6 +131,8 @@ Useful columns to inspect first:
   - Set `HF_HOME` to a writable path (e.g. `./.hf_cache`).
 - Many `TYPE_B` failures:
   - Increase compression budget or reduce redundancy strictness.
+- Query has misspellings or noisy wording:
+  - The pipeline attempts auto-correction and fallback retrieval automatically; if results are still weak, rephrase with one concrete entity phrase (e.g., full proper noun) to improve retrieval coverage.
 
 ## Repository Layout
 

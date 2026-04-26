@@ -392,3 +392,23 @@ _Appended; all sections above remain as-is._
   - `K_BASE_MIN=3`, `K_BASE_MAX=10`, **`K_HARD_CAP=10`**, `LOW_CONF_BONUS=2`, `RETRY_BONUS=1`.
 - Low-confidence bump and coverage-retry bump now both respect the same hard cap constant.
 - Removes prior split-cap behavior (`k_base` capped at 10 while bump/retry could reach 12).
+
+## Updates — Apr 25, 2026 (general typo-robust query handling)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` generalization
+- Replaced narrow hardcoded typo replacements with a **corpus-driven spell-correction path**.
+- Built a lightweight in-memory vocabulary index from `data/documents/**/*.txt` and used fuzzy matching (`difflib`) to normalize noisy query tokens.
+- Added conservative token guardrails (stopword + short-token excludes) plus small edit heuristics (leading/trailing character noise) before fuzzy correction.
+- Query flow now uses **original + normalized + spell-corrected** variants for cache lookup and robustness retries.
+
+### Retry behavior updates
+- Kept the low-quality fallback retry but made it **general** (not founder-specific):
+  - triggers on weak retrieval/answer quality signals,
+  - retries retrieval with stronger settings and candidate query variant,
+  - adopts retry output only when confidence improves.
+
+### Scope cleanup
+- Removed the temporary founder-specific hard override path so behavior remains generic across intents.
+- Retained existing non-session semantic cache behavior and session-document cache bypass.

@@ -12,6 +12,8 @@ The return dict aggregates stage timings, retrieval/compression/router/confidenc
 and the final answer (for ``evaluate.py`` and logging).
 """
 from pathlib import Path
+import difflib
+import re
 import time
 
 from src.query_analyzer import QueryAnalyzer
@@ -31,30 +33,110 @@ class RAGPipeline:
 
     def __init__(self, documents_path=None):
         documents_path = documents_path or str(PROJECT_ROOT / "data" / "documents")
+        self.documents_path = Path(documents_path)
         self.analyzer = QueryAnalyzer()
         self.retriever = AdaptiveRetriever(documents_path=documents_path)
         self.compressor = ContextCompressor()
         self.router = ModelRouter()
         self.semantic_cache = SemanticCache()
         self.corpus_hash = SemanticCache.get_corpus_hash(CHROMA_DIR)
+        self._vocab_index_cache = None
+        self._vocab_all_cache = None
         log_pipeline_startup(PROJECT_ROOT, documents_path)
 
-    def run(self, query: str) -> dict:
+    SPELLCHECK_EXCLUDE = {
+        "the", "a", "an", "is", "are", "was", "were", "be", "to", "of", "and",
+        "or", "for", "in", "on", "at", "with", "by", "from", "that", "this",
+        "it", "as", "what", "which", "who", "when", "where", "how", "why",
+        "university", "notre", "dame",
+    }
+    QUERY_HINT_VOCAB = {
+        "founded", "founder", "founding", "established", "history", "campus",
+        "academics", "admissions", "students", "faculty", "library", "college",
+        "program", "tuition", "ranking", "rankings", "notre", "dame", "university",
+    }
+
+    def _build_vocab_index(self) -> dict[str, set[str]]:
+        if self._vocab_index_cache is not None:
+            return self._vocab_index_cache
+        index: dict[str, set[str]] = {}
+        if self.documents_path.exists():
+            for txt_file in self.documents_path.glob("**/*.txt"):
+                try:
+                    content = txt_file.read_text(encoding="utf-8", errors="ignore").lower()
+                except OSError:
+                    continue
+                for token in re.findall(r"[a-z]{3,}", content):
+                    index.setdefault(token[0], set()).add(token)
+        self._vocab_index_cache = index
+        self._vocab_all_cache = sorted({tok for bucket in index.values() for tok in bucket})
+        return index
+
+    def _spell_correct_query(self, normalized_query: str) -> str:
+        vocab_index = self._build_vocab_index()
+        full_vocab = set(self._vocab_all_cache or []) | self.QUERY_HINT_VOCAB
+
+        def _replace(match: re.Match) -> str:
+            token = match.group(0)
+            if len(token) < 4 or token in self.SPELLCHECK_EXCLUDE:
+                return token
+            if token[1:] in full_vocab:
+                return token[1:]
+            if token[:-1] in full_vocab:
+                return token[:-1]
+            if len(token) > 5 and token[0] == token[1] and token[1:] in full_vocab:
+                return token[1:]
+            candidates = list(vocab_index.get(token[0], set()))
+            if not candidates or token in candidates:
+                candidates = list(full_vocab)
+                if not candidates or token in candidates:
+                    return token
+            close = difflib.get_close_matches(token, candidates, n=1, cutoff=0.78)
+            return close[0] if close else token
+
+        return re.sub(r"[a-z]+", _replace, normalized_query)
+
+    def _normalize_query_text(self, query: str) -> tuple[str, str]:
+        text = (query or "").strip()
+        if not text:
+            return "", ""
+        normalized = re.sub(r"\s+", " ", text)
+        lowered = normalized.lower()
+        corrected = self._spell_correct_query(lowered)
+        return lowered, corrected
+
+    def _build_query_variants(self, original_query: str, normalized_query: str, corrected_query: str) -> list[str]:
+        variants: list[str] = []
+        for candidate in [original_query.strip(), normalized_query.strip(), corrected_query.strip()]:
+            if candidate and candidate not in variants:
+                variants.append(candidate)
+        return variants
+
+    def run(self, query: str, session_documents: list[str] | None = None) -> dict:
         run_start = time.perf_counter()
         print(f"\n{'='*60}")
         print(f"Query: {query}")
+        normalized_query, corrected_query = self._normalize_query_text(query)
+        if corrected_query and corrected_query != normalized_query:
+            print(f"Spell-corrected query: {corrected_query}")
+        elif normalized_query and normalized_query != (query or "").strip().lower():
+            print(f"Normalized query: {normalized_query}")
+        session_documents = [d for d in (session_documents or []) if isinstance(d, str) and d.strip()]
+        has_session_docs = len(session_documents) > 0
 
         # Fast path — semantic cache lookup before analyzer/retrieval/compression/router.
-        cached_result = self.semantic_cache.lookup(query, self.corpus_hash)
-        if cached_result is not None:
-            print(
-                f"[SemanticCache] Cache hit (similarity={cached_result.get('cache_similarity')})"
-            )
-            return cached_result
+        if not has_session_docs:
+            for candidate_query in self._build_query_variants(query, normalized_query, corrected_query):
+                cached_result = self.semantic_cache.lookup(candidate_query, self.corpus_hash)
+                if cached_result is not None:
+                    print(
+                        f"[SemanticCache] Cache hit (similarity={cached_result.get('cache_similarity')})"
+                    )
+                    return cached_result
 
         # Step 1 — Classify query complexity
         t0 = time.perf_counter()
-        analysis = self.analyzer.analyze(query)
+        analysis = self.analyzer.analyze(corrected_query or normalized_query or query)
         query_analyzer_ms = round((time.perf_counter() - t0) * 1000, 2)
         complexity = analysis["complexity_label"]
         print(
@@ -65,13 +147,28 @@ class RAGPipeline:
         # Step 2 — Retrieve relevant chunks
         t0 = time.perf_counter()
         retrieval = self.retriever.retrieve(
-            query=query,
+            query=corrected_query or normalized_query or query,
             complexity=complexity,
             complexity_score=analysis.get("complexity_score"),
             analyzer_confidence=analysis.get("confidence"),
         )
         retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
         docs = retrieval["docs"]
+        if has_session_docs:
+            docs = docs + session_documents
+            print(f"Added {len(session_documents)} session-level uploaded document(s) to context.")
+            session_chunks = []
+            base_idx = len(retrieval["chunks"])
+            for i, _ in enumerate(session_documents):
+                session_chunks.append(
+                    {
+                        "chunk_index": base_idx + i,
+                        "source": f"session_upload_{i+1}",
+                        "chroma_distance": "",
+                        "similarity_score": "",
+                    }
+                )
+            retrieval["chunks"] = retrieval["chunks"] + session_chunks
         print(
             f"Retrieved {retrieval['k']} chunks "
             f"(k_base={retrieval['k_base']}, coverage={retrieval['coverage_score']}, retry={retrieval['retrieval_retry']}):"
@@ -83,7 +180,7 @@ class RAGPipeline:
         # Step 3 — Compress context
         t0 = time.perf_counter()
         compression = self.compressor.compress(
-            query,
+            corrected_query or normalized_query or query,
             docs,
             complexity,
             complexity_score=analysis.get("complexity_score"),
@@ -99,7 +196,7 @@ class RAGPipeline:
 
         # Step 4 — Route to appropriate model and generate answer
         t0 = time.perf_counter()
-        router_result = self.router.route(query, complexity, compression)
+        router_result = self.router.route(corrected_query or normalized_query or query, complexity, compression)
         model_router_ms = round((time.perf_counter() - t0) * 1000, 2)
         print(f"Model used: {router_result['model_used']} | Input tokens: {router_result['input_tokens']} | Output tokens: {router_result['output_tokens']} | Time: {router_result['time_taken_seconds']}s")
         print(f"Initial answer: {router_result['answer']}")
@@ -107,11 +204,56 @@ class RAGPipeline:
         # Step 5 — Confidence check and retry if needed
         t0 = time.perf_counter()
         confidence_result = check_confidence(
-            query=query,
+            query=corrected_query or normalized_query or query,
             compressed_context=compression["compressed_context"],
             router_output=router_result,
             analyzer_output=analysis,
         )
+        low_quality_answer = any(
+            marker in (confidence_result.get("final_answer", "").lower())
+            for marker in ["does not provide information", "insufficient", "could you clarify", "not enough context"]
+        )
+        should_retry_robust = (
+            not has_session_docs
+            and (
+                (
+                    retrieval.get("coverage_score", 1.0) < 0.55
+                    and confidence_result.get("confidence_score_final", 1.0) < 0.50
+                )
+                or (confidence_result.get("confidence_score_final", 1.0) < 0.60 and low_quality_answer)
+            )
+            and not retrieval.get("retrieval_retry", False)
+        )
+        if should_retry_robust:
+            print("Low-quality signal detected. Running typo-tolerant retrieval retry...")
+            robust_query = self._build_query_variants(query, normalized_query, corrected_query)[-1]
+            robust_retrieval = self.retriever.retrieve(
+                query=robust_query,
+                complexity=max(complexity, "medium", key=lambda x: {"simple": 0, "medium": 1, "complex": 2}[x]),
+                complexity_score=max(float(analysis.get("complexity_score") or 0.0), 0.55),
+                analyzer_confidence=0.0,
+            )
+            robust_docs = robust_retrieval["docs"]
+            robust_compression = self.compressor.compress(
+                robust_query,
+                robust_docs,
+                complexity,
+                complexity_score=max(float(analysis.get("complexity_score") or 0.0), 0.55),
+                coverage_score=robust_retrieval.get("coverage_score"),
+            )
+            robust_router = self.router.route(robust_query, complexity, robust_compression)
+            robust_confidence = check_confidence(
+                query=robust_query,
+                compressed_context=robust_compression["compressed_context"],
+                router_output=robust_router,
+                analyzer_output=analysis,
+            )
+            if robust_confidence.get("confidence_score_final", 0.0) > confidence_result.get("confidence_score_final", 0.0):
+                print("Using robust retry result (improved confidence).")
+                retrieval = robust_retrieval
+                compression = robust_compression
+                router_result = robust_router
+                confidence_result = robust_confidence
         confidence_checker_ms = round((time.perf_counter() - t0) * 1000, 2)
         breakdown = confidence_result["score_breakdown"]
         print(f"Score breakdown — heuristic: {breakdown['heuristic']} | tfidf: {breakdown['tfidf']} | embedding: {breakdown['embedding']} | semantic: {breakdown['semantic']}")
@@ -214,5 +356,6 @@ class RAGPipeline:
             "final_answer": confidence_result["final_answer"],
             "cache_hit": False,
         }
-        self.semantic_cache.store(query, result, self.corpus_hash)
+        if not has_session_docs:
+            self.semantic_cache.store(query, result, self.corpus_hash)
         return result
