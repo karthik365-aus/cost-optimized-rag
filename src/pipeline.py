@@ -13,8 +13,12 @@ and the final answer (for ``evaluate.py`` and logging).
 """
 from pathlib import Path
 import difflib
+import os
 import re
 import time
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI
 
 from src.query_analyzer import QueryAnalyzer
 from src.adaptive_retriever import AdaptiveRetriever
@@ -55,6 +59,9 @@ class RAGPipeline:
         "academics", "admissions", "students", "faculty", "library", "college",
         "program", "tuition", "ranking", "rankings", "notre", "dame", "university",
     }
+    USE_HYDE = os.getenv("USE_HYDE", "false").lower() == "true"
+    HYDE_MIN_COVERAGE_GAIN = float(os.getenv("HYDE_MIN_COVERAGE_GAIN", "0.03"))
+    HYDE_MAX_CHARS = int(os.getenv("HYDE_MAX_CHARS", "700"))
 
     def _build_vocab_index(self) -> dict[str, set[str]]:
         if self._vocab_index_cache is not None:
@@ -112,6 +119,233 @@ class RAGPipeline:
                 variants.append(candidate)
         return variants
 
+    def _generate_hyde_text(self, query: str, complexity: str) -> str:
+        if not self.USE_HYDE:
+            return ""
+        complexity_rank = {"simple": 0, "medium": 1, "complex": 2}
+        preferred = "medium" if complexity_rank.get(complexity, 1) < 1 else complexity
+        model_name = self.router.model_map.get(preferred, self.router.model_map.get("medium"))
+        try:
+            llm_kwargs = {
+                "model": model_name,
+                "temperature": 0.0,
+                "base_url": self.router.local_openai_base_url,
+                "api_key": self.router.local_openai_api_key,
+            }
+            if self.router.local_healthcheck_enabled:
+                self.router._ensure_local_model_available(model_name)
+            llm = ChatOpenAI(**llm_kwargs)
+            msg = [
+                SystemMessage(
+                    content=(
+                        "Generate a concise, factual paragraph that could answer the question. "
+                        "Use neutral wording and avoid speculation. No bullet points."
+                    )
+                ),
+                HumanMessage(content=f"Question: {query}"),
+            ]
+            response = llm.invoke(msg)
+            content = getattr(response, "content", "") or ""
+            if isinstance(content, list):
+                content = "\n".join(
+                    item.get("text", "") if isinstance(item, dict) else getattr(item, "text", "")
+                    for item in content
+                )
+            return str(content).strip()[: self.HYDE_MAX_CHARS]
+        except Exception as exc:
+            print(f"[HyDE] skipped due to generation failure: {type(exc).__name__}: {exc}")
+            return ""
+
+    @staticmethod
+    def _extract_answer_entities(text: str) -> set[str]:
+        raw = text or ""
+        # Capture title-cased entity-like spans (1-4 words) and normalize.
+        spans = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", raw)
+        entities = {re.sub(r"\s+", " ", s.strip().lower()) for s in spans}
+        # Remove common sentence starters and generic fillers.
+        drop = {
+            "the", "this", "that", "it", "i", "we", "you", "notre", "dame",
+            "university", "context", "provided", "information",
+        }
+        return {e for e in entities if e not in drop and len(e) >= 4}
+
+    def _grounding_gate(self, answer: str, context: str) -> tuple[bool, dict]:
+        ans = (answer or "").strip()
+        ctx = (context or "").lower()
+        if not ans or not ctx:
+            return False, {"reason": "empty_answer_or_context", "unsupported_entities": []}
+
+        entities = self._extract_answer_entities(ans)
+        unsupported = [e for e in entities if e not in ctx]
+
+        # If answer introduces unseen entities, treat as ungrounded.
+        if unsupported:
+            return False, {"reason": "unsupported_entities", "unsupported_entities": unsupported}
+        return True, {"reason": "grounded", "unsupported_entities": []}
+
+    @staticmethod
+    def _is_factual_query(query: str) -> bool:
+        q = (query or "").lower().strip()
+        factual_starts = ("who ", "when ", "where ", "how many", "what is", "what was", "which ")
+        analytical_markers = ("compare", "analyze", "explain why", "strategy", "impact of", "trade-off")
+        return q.startswith(factual_starts) and not any(m in q for m in analytical_markers)
+
+    @staticmethod
+    def _subject_aliases(subject: str) -> set[str]:
+        raw = re.sub(r"\s+", " ", (subject or "").strip().lower())
+        raw = re.sub(r"[^\w\s&.-]", "", raw).strip()
+        if not raw:
+            return set()
+        aliases = {raw}
+        if raw.startswith("the "):
+            aliases.add(raw[4:].strip())
+        if raw.startswith("university of "):
+            core = raw[len("university of "):].strip()
+            if core:
+                aliases.add(core)
+        else:
+            aliases.add(f"university of {raw}")
+        if raw.startswith("college of "):
+            core = raw[len("college of "):].strip()
+            if core:
+                aliases.add(core)
+        if " and " in raw:
+            aliases.add(raw.replace(" and ", " & "))
+        if " & " in raw:
+            aliases.add(raw.replace(" & ", " and "))
+        words = re.findall(r"[a-z0-9]+", raw)
+        if len(words) >= 2:
+            acronym = "".join(w[0] for w in words if w)
+            if len(acronym) >= 2:
+                aliases.add(acronym)
+                aliases.add(" ".join(acronym))
+                aliases.add(".".join(acronym) + ".")
+        return {a for a in aliases if a}
+
+    @classmethod
+    def _alias_match_strength(cls, text: str, aliases: set[str]) -> float:
+        text_l = (text or "").lower()
+        if not text_l or not aliases:
+            return 0.0
+        best = 0.0
+        text_tokens = set(re.findall(r"[a-z0-9]+", text_l))
+        for alias in aliases:
+            alias_l = alias.lower().strip()
+            if not alias_l:
+                continue
+            if alias_l in text_l:
+                best = max(best, 1.0)
+                continue
+            alias_tokens = set(re.findall(r"[a-z0-9]+", alias_l))
+            if not alias_tokens:
+                continue
+            j = len(alias_tokens & text_tokens) / max(1, len(alias_tokens))
+            best = max(best, j)
+        return best
+
+    @staticmethod
+    def _alias_near_founding_verb(text: str, aliases: set[str], max_distance: int = 90) -> bool:
+        text_l = (text or "").lower()
+        if not text_l:
+            return False
+        verb_positions = [m.start() for m in re.finditer(r"\b(founded|founder|established|started)\b", text_l)]
+        if not verb_positions:
+            return False
+        phrase_aliases = [a for a in aliases if len(a.strip()) >= 4]
+        for alias in phrase_aliases:
+            start = text_l.find(alias)
+            if start == -1:
+                continue
+            if any(abs(start - vp) <= max_distance for vp in verb_positions):
+                return True
+        return False
+
+    def _extractive_answer(self, query: str, factual_hits: list[dict]) -> str | None:
+        if not factual_hits:
+            return None
+        q = (query or "").lower()
+        query_tokens = set(re.findall(r"[a-z0-9]+", q))
+        stop = {
+            "the", "a", "an", "is", "are", "was", "were", "of", "for", "to", "in",
+            "on", "at", "and", "or", "do", "does", "did", "how", "what", "who",
+            "when", "where", "which", "many",
+        }
+        query_tokens = {t for t in query_tokens if t not in stop}
+
+        def overlap_score(text: str) -> float:
+            tokens = set(re.findall(r"[a-z0-9]+", (text or "").lower()))
+            return len(tokens & query_tokens) / max(1, len(query_tokens))
+
+        if re.match(r"^who\s+(founded|established|started)\s+", q):
+            subject = re.sub(r"^who\s+(founded|established|started)\s+", "", q).strip(" ?.")
+            aliases = self._subject_aliases(subject)
+            candidates = []
+            for h in factual_hits:
+                text = h.get("text", "")
+                text_l = text.lower()
+                if not any(v in text_l for v in ("founded", "founder", "established", "started")):
+                    continue
+                if not self._alias_near_founding_verb(text_l, aliases):
+                    continue
+                alias_strength = self._alias_match_strength(text_l, aliases)
+                if alias_strength < 0.75:
+                    continue
+                subentity_penalty = any(
+                    kw in text_l
+                    for kw in ("review", "journal", "newspaper", "magazine", "program", "department")
+                )
+                by_phrase_bonus = 0.2 if re.search(r"\b(founded|established|started)\s+by\b", text_l) else 0.0
+                score = (
+                    0.45 * overlap_score(text)
+                    + 0.35 * float(h.get("score", 0.0))
+                    + 0.20 * alias_strength
+                    + by_phrase_bonus
+                    - (0.35 if subentity_penalty else 0.0)
+                )
+                candidates.append((score, text))
+            if candidates:
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                best_score, best_text = candidates[0]
+                if best_score >= 0.45:
+                    return best_text
+            return None
+
+        if "how many" in q:
+            for h in sorted(factual_hits, key=lambda x: overlap_score(x["text"]), reverse=True):
+                m = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", h["text"], re.I)
+                if m:
+                    return h["text"]
+        if "when" in q or "what year" in q:
+            for h in sorted(factual_hits, key=lambda x: overlap_score(x["text"]), reverse=True):
+                if re.search(r"\b(18|19|20)\d{2}\b", h["text"]):
+                    return h["text"]
+        ranked = sorted(
+            factual_hits,
+            key=lambda x: (overlap_score(x["text"]), x.get("score", 0.0)),
+            reverse=True,
+        )
+        return ranked[0]["text"] if ranked else None
+
+    @staticmethod
+    def _build_uncompressed_context(docs, max_chars: int = 20000) -> str:
+        parts = []
+        total = 0
+        for d in docs or []:
+            text = getattr(d, "page_content", d if isinstance(d, str) else str(d))
+            if not text:
+                continue
+            chunk = str(text).strip()
+            if not chunk:
+                continue
+            if total + len(chunk) > max_chars:
+                remain = max_chars - total
+                if remain > 0:
+                    parts.append(chunk[:remain])
+                break
+            parts.append(chunk)
+            total += len(chunk)
+        return "\n\n".join(parts).strip()
+
     def run(self, query: str, session_documents: list[str] | None = None) -> dict:
         run_start = time.perf_counter()
         print(f"\n{'='*60}")
@@ -144,14 +378,59 @@ class RAGPipeline:
             f"(confidence={analysis['confidence']}, source={analysis['source']}, llm_status={analysis['llm_status']})"
         )
 
-        # Step 2 — Retrieve relevant chunks
+        # Step 2 — Retrieve relevant chunks (optional HyDE alternate query)
         t0 = time.perf_counter()
+        retrieval_query = corrected_query or normalized_query or query
         retrieval = self.retriever.retrieve(
-            query=corrected_query or normalized_query or query,
+            query=retrieval_query,
             complexity=complexity,
             complexity_score=analysis.get("complexity_score"),
             analyzer_confidence=analysis.get("confidence"),
         )
+        hyde_attempted = False
+        hyde_used = False
+        hyde_query = ""
+        hyde_coverage = None
+        if (
+            self.USE_HYDE
+            and not has_session_docs
+            and self._is_factual_query(normalized_query or query)
+        ):
+            hyde_attempted = True
+            hyde_query = self._generate_hyde_text(normalized_query or query, complexity)
+            if hyde_query:
+                hyde_retrieval = self.retriever.retrieve(
+                    query=hyde_query,
+                    complexity=complexity,
+                    complexity_score=analysis.get("complexity_score"),
+                    analyzer_confidence=analysis.get("confidence"),
+                )
+                hyde_coverage = hyde_retrieval.get("coverage_score")
+                base_cov = retrieval.get("coverage_score", 0.0)
+                if (hyde_coverage or 0.0) >= (base_cov + self.HYDE_MIN_COVERAGE_GAIN):
+                    retrieval = hyde_retrieval
+                    hyde_used = True
+                    print(
+                        f"[HyDE] adopted alternate retrieval query "
+                        f"(coverage {round(base_cov, 4)} -> {round(hyde_coverage or 0.0, 4)})."
+                    )
+                else:
+                    print(
+                        f"[HyDE] not adopted "
+                        f"(base coverage={round(base_cov, 4)}, hyde coverage={round(hyde_coverage or 0.0, 4)})."
+                    )
+            else:
+                print("[HyDE] no alternate text generated; using original retrieval.")
+
+        retrieval_query_used = hyde_query if hyde_used else retrieval_query
+        retrieval = {
+            **retrieval,
+            "hyde_attempted": hyde_attempted,
+            "hyde_used": hyde_used,
+            "hyde_query_preview": (hyde_query[:200] if hyde_query else ""),
+            "hyde_coverage_score": hyde_coverage,
+            "retrieval_query_used": retrieval_query_used,
+        }
         retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
         docs = retrieval["docs"]
         if has_session_docs:
@@ -176,30 +455,83 @@ class RAGPipeline:
         for c in retrieval["chunks"]:
             _d = c.get("chroma_distance", c.get("similarity_score", ""))
             print(f"  [{c['chunk_index']}] {c['source']} (chroma distance: {_d}, lower is better)")
+        if retrieval.get("hyde_attempted"):
+            print(
+                f"[HyDE] attempted={retrieval.get('hyde_attempted')} used={retrieval.get('hyde_used')} "
+                f"alt_coverage={retrieval.get('hyde_coverage_score')}"
+            )
 
-        # Step 3 — Compress context
-        t0 = time.perf_counter()
-        compression = self.compressor.compress(
-            corrected_query or normalized_query or query,
-            docs,
-            complexity,
-            complexity_score=analysis.get("complexity_score"),
-            coverage_score=retrieval.get("coverage_score"),
-        )
-        compression_ms = round((time.perf_counter() - t0) * 1000, 2)
-        _cm = compression.get("compression_metadata") or {}
-        print(f"Tokens: {compression['original_token_count']} → {compression['compressed_token_count']} (ratio: {compression['compression_ratio']})")
-        print(
-            f"Sentences kept: {compression['selected_indices']} of {len(compression['all_sentences'])} total "
-            f"(budget={_cm.get('adaptive_top_n', '?')}, embed={_cm.get('used_embeddings', '?')})"
-        )
+        # Step 3/4 — Factual extraction-first path OR regular compression+router path
+        use_factual_branch = False
+        factual_hits = []
+        extracted_answer = None
+        if self._is_factual_query(normalized_query or query):
+            factual_hits = self.retriever.retrieve_factual_sentences(
+                normalized_query or query,
+                top_n=20,
+            )
+            extracted_answer = self._extractive_answer(normalized_query or query, factual_hits)
+            if extracted_answer:
+                use_factual_branch = True
 
-        # Step 4 — Route to appropriate model and generate answer
-        t0 = time.perf_counter()
-        router_result = self.router.route(corrected_query or normalized_query or query, complexity, compression)
-        model_router_ms = round((time.perf_counter() - t0) * 1000, 2)
-        print(f"Model used: {router_result['model_used']} | Input tokens: {router_result['input_tokens']} | Output tokens: {router_result['output_tokens']} | Time: {router_result['time_taken_seconds']}s")
-        print(f"Initial answer: {router_result['answer']}")
+        if use_factual_branch:
+            t0 = time.perf_counter()
+            factual_context = "\n".join(h["text"] for h in factual_hits)
+            orig_tok = len(factual_context.split())
+            out_tok = len(extracted_answer.split())
+            compression = {
+                "compressed_context": factual_context,
+                "selected_sentences": [h["text"] for h in factual_hits],
+                "all_sentences": [h["text"] for h in factual_hits],
+                "sentence_scores": [{"sentence": h["text"], "final_score": h["score"]} for h in factual_hits],
+                "selected_indices": list(range(len(factual_hits))),
+                "original_text": factual_context,
+                "original_token_count": orig_tok,
+                "compressed_token_count": orig_tok,
+                "compression_ratio": 0.0,
+                "compression_metadata": {
+                    "mode": "factual_sentence_index_extractive",
+                    "top_n": len(factual_hits),
+                },
+            }
+            compression_ms = round((time.perf_counter() - t0) * 1000, 2)
+            router_result = {
+                "answer": extracted_answer,
+                "model_used": "extractive-factual",
+                "model_source": "extractive",
+                "fallback_reason": None,
+                "complexity": complexity,
+                "input_tokens": orig_tok,
+                "output_tokens": out_tok,
+                "time_taken_seconds": 0.0,
+            }
+            model_router_ms = 0.0
+            print("Using factual extraction-first path (sentence index, no compression).")
+            print(f"Factual hits: {len(factual_hits)} | Extracted answer: {extracted_answer}")
+        else:
+            # Step 3 — Compress context
+            t0 = time.perf_counter()
+            compression = self.compressor.compress(
+                corrected_query or normalized_query or query,
+                docs,
+                complexity,
+                complexity_score=analysis.get("complexity_score"),
+                coverage_score=retrieval.get("coverage_score"),
+            )
+            compression_ms = round((time.perf_counter() - t0) * 1000, 2)
+            _cm = compression.get("compression_metadata") or {}
+            print(f"Tokens: {compression['original_token_count']} → {compression['compressed_token_count']} (ratio: {compression['compression_ratio']})")
+            print(
+                f"Sentences kept: {compression['selected_indices']} of {len(compression['all_sentences'])} total "
+                f"(budget={_cm.get('adaptive_top_n', '?')}, embed={_cm.get('used_embeddings', '?')})"
+            )
+
+            # Step 4 — Route to appropriate model and generate answer
+            t0 = time.perf_counter()
+            router_result = self.router.route(corrected_query or normalized_query or query, complexity, compression)
+            model_router_ms = round((time.perf_counter() - t0) * 1000, 2)
+            print(f"Model used: {router_result['model_used']} | Input tokens: {router_result['input_tokens']} | Output tokens: {router_result['output_tokens']} | Time: {router_result['time_taken_seconds']}s")
+            print(f"Initial answer: {router_result['answer']}")
 
         # Step 5 — Confidence check and retry if needed
         t0 = time.perf_counter()
@@ -254,6 +586,112 @@ class RAGPipeline:
                 compression = robust_compression
                 router_result = robust_router
                 confidence_result = robust_confidence
+
+        deep_openai_attempted = False
+        deep_openai_used = False
+        should_deep_openai = (
+            not has_session_docs
+            and (
+                confidence_result.get("confidence_score_final", 1.0) < 0.55
+                or low_quality_answer
+            )
+            and bool(os.getenv("OPENAI_API_KEY", "").strip())
+        )
+        if should_deep_openai:
+            deep_openai_attempted = True
+            print("Low-quality signal persists. Running deep retrieval with OpenAI and no compression...")
+            try:
+                deep_retrieval = self.retriever.retrieve(
+                    query=corrected_query or normalized_query or query,
+                    complexity="complex",
+                    complexity_score=1.0,
+                    analyzer_confidence=0.0,
+                )
+                deep_context = self._build_uncompressed_context(deep_retrieval.get("docs") or [])
+                deep_compression = {
+                    "compressed_context": deep_context,
+                    "all_sentences": [],
+                    "sentence_scores": [],
+                    "selected_indices": [],
+                    "original_token_count": 0,
+                    "compressed_token_count": 0,
+                    "compression_ratio": 0.0,
+                    "compression_metadata": {"mode": "deep_openai_no_compression"},
+                }
+                deep_router = self.router.route(
+                    corrected_query or normalized_query or query,
+                    "complex",
+                    deep_compression,
+                )
+                deep_confidence = check_confidence(
+                    query=corrected_query or normalized_query or query,
+                    compressed_context=deep_context,
+                    router_output=deep_router,
+                    analyzer_output=analysis,
+                )
+                deep_grounded_ok, _ = self._grounding_gate(
+                    deep_confidence.get("final_answer", ""),
+                    deep_context,
+                )
+                if deep_grounded_ok and deep_confidence.get("confidence_score_final", 0.0) >= confidence_result.get("confidence_score_final", 0.0):
+                    print("Using deep OpenAI fallback result.")
+                    retrieval = deep_retrieval
+                    compression = deep_compression
+                    router_result = deep_router
+                    confidence_result = deep_confidence
+                    deep_openai_used = True
+            except Exception as exc:
+                print(f"[Pipeline] Deep OpenAI fallback failed: {type(exc).__name__}: {exc}")
+
+        grounded_ok, grounding_meta = self._grounding_gate(
+            confidence_result.get("final_answer", ""),
+            compression.get("compressed_context", ""),
+        )
+        openai_fallback_attempted = False
+        openai_fallback_used = False
+        if not grounded_ok:
+            can_escalate_openai = (
+                router_result.get("model_source") == "local_openai_compatible"
+                and bool(os.getenv("OPENAI_API_KEY", "").strip())
+            )
+            if can_escalate_openai:
+                openai_fallback_attempted = True
+                try:
+                    openai_router_result = self.router.route(
+                        corrected_query or normalized_query or query,
+                        "complex",
+                        compression,
+                    )
+                    openai_confidence = check_confidence(
+                        query=corrected_query or normalized_query or query,
+                        compressed_context=compression["compressed_context"],
+                        router_output=openai_router_result,
+                        analyzer_output=analysis,
+                    )
+                    openai_grounded_ok, openai_grounding_meta = self._grounding_gate(
+                        openai_confidence.get("final_answer", ""),
+                        compression.get("compressed_context", ""),
+                    )
+                    if openai_grounded_ok:
+                        openai_fallback_used = True
+                        router_result = openai_router_result
+                        confidence_result = openai_confidence
+                        grounded_ok = openai_grounded_ok
+                        grounding_meta = openai_grounding_meta
+                except Exception as exc:
+                    print(f"[Pipeline] OpenAI fallback attempt failed: {type(exc).__name__}: {exc}")
+
+            if not openai_fallback_used:
+                confidence_result["final_answer"] = (
+                    "I don't have enough grounded evidence in the retrieved context to answer this reliably. "
+                    "Please rephrase the query or provide more specific context."
+                )
+                confidence_result["confidence_score_final"] = min(
+                    float(confidence_result.get("confidence_score_final", 0.0)), 0.35
+                )
+                confidence_result["retry_reason"] = (
+                    (confidence_result.get("retry_reason") or "") + " | grounding_gate"
+                ).strip(" |")
         confidence_checker_ms = round((time.perf_counter() - t0) * 1000, 2)
         breakdown = confidence_result["score_breakdown"]
         print(f"Score breakdown — heuristic: {breakdown['heuristic']} | tfidf: {breakdown['tfidf']} | embedding: {breakdown['embedding']} | semantic: {breakdown['semantic']}")
@@ -318,6 +756,11 @@ class RAGPipeline:
             "retrieval_retry": retrieval["retrieval_retry"],
             "coverage_threshold_used": retrieval.get("coverage_threshold_used"),
             "retrieval_retry_confidence_gate": retrieval.get("retry_confidence_gate_used"),
+            "hyde_attempted": retrieval.get("hyde_attempted", False),
+            "hyde_used": retrieval.get("hyde_used", False),
+            "hyde_query_preview": retrieval.get("hyde_query_preview", ""),
+            "hyde_coverage_score": retrieval.get("hyde_coverage_score"),
+            "retrieval_query_used": retrieval.get("retrieval_query_used", retrieval_query),
             "retrieval_avg_chunk_distance": _retrieval_avg_chunk_metric,
             "chunks": retrieval["chunks"],
             # compression metadata
@@ -354,6 +797,49 @@ class RAGPipeline:
             "model_used_final": confidence_result["model_used_final"],
             "model_rerouted": _model_rerouted,
             "final_answer": confidence_result["final_answer"],
+            "grounding_gate_passed": grounded_ok,
+            "grounding_gate_reason": grounding_meta.get("reason"),
+            "grounding_gate_unsupported_entities": grounding_meta.get("unsupported_entities"),
+            "openai_fallback_attempted": openai_fallback_attempted,
+            "openai_fallback_used": openai_fallback_used,
+            "deep_openai_attempted": deep_openai_attempted,
+            "deep_openai_used": deep_openai_used,
+            "cache_hit": False,
+        }
+        top_factual_hits = [
+            {
+                "text": (h.get("text") or "")[:180],
+                "source": h.get("source", "unknown"),
+                "score": h.get("score", 0.0),
+            }
+            for h in (factual_hits or [])[:5]
+        ]
+        result["retrieval_diagnostics"] = {
+            "factual_extraction_attempted": self._is_factual_query(normalized_query or query),
+            "factual_extraction_used": use_factual_branch,
+            "factual_hit_count": len(factual_hits or []),
+            "factual_top_hits": top_factual_hits,
+            "compression_mode": (compression.get("compression_metadata") or {}).get("mode", "standard"),
+            "k_base": retrieval.get("k_base"),
+            "k_final": retrieval.get("k_final"),
+            "coverage_score": retrieval.get("coverage_score"),
+            "retrieval_retry": retrieval.get("retrieval_retry"),
+            "hyde_attempted": retrieval.get("hyde_attempted", False),
+            "hyde_used": retrieval.get("hyde_used", False),
+            "hyde_coverage_score": retrieval.get("hyde_coverage_score"),
+            "retrieval_sources_top5": [
+                {
+                    "source": c.get("source", "unknown"),
+                    "distance": c.get("chroma_distance", c.get("similarity_score", "")),
+                }
+                for c in (retrieval.get("chunks") or [])[:5]
+            ],
+            "grounding_gate_passed": grounded_ok,
+            "grounding_gate_reason": grounding_meta.get("reason"),
+            "openai_fallback_attempted": openai_fallback_attempted,
+            "openai_fallback_used": openai_fallback_used,
+            "deep_openai_attempted": deep_openai_attempted,
+            "deep_openai_used": deep_openai_used,
             "cache_hit": False,
         }
         if not has_session_docs:

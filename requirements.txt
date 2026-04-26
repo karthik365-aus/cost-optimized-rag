@@ -2,6 +2,7 @@ langchain
 langchain-community
 langchain-openai
 langchain-text-splitters
+langchain-experimental
 chromadb
 python-dotenv
 tiktoken
@@ -10,3 +11,7 @@ sentence-transformers
 numpy
 openai
 transformers
+fastapi
+uvicorn
+pypdf
+streamlit

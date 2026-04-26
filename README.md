@@ -163,3 +163,31 @@ cost-optimized-rag/
 
 - `CLAUDE.md/CLAUDE.md` for implementation history and design decisions
 - `TEAM_GUIDE.md` for teammate workflow and ownership notes
+
+## Recent Updates (Apr 25, 2026)
+
+- **Semantic chunking option added in retriever**
+  - `src/adaptive_retriever.py` now supports `SemanticChunker` (topic-aware splits) with fallback to `RecursiveCharacterTextSplitter`.
+  - New env flags:
+    - `USE_SEMANTIC_CHUNKER` (default `true`)
+    - `SEMANTIC_BREAKPOINT_TYPE` (default `percentile`)
+    - `SEMANTIC_BREAKPOINT_AMOUNT` (default `85`)
+  - `requirements.txt` now includes `langchain-experimental`.
+  - Chroma rebuild is auto-triggered on chunking config/version change.
+
+- **Optional HyDE retrieval in pipeline**
+  - `src/pipeline.py` now supports query-time HyDE behind `USE_HYDE` (default `false`).
+  - Flow: generate one hypothetical retrieval text -> run alternate retrieval -> adopt only if coverage improves.
+  - Tunables:
+    - `HYDE_MIN_COVERAGE_GAIN` (default `0.03`)
+    - `HYDE_MAX_CHARS` (default `700`)
+  - Result payload includes: `hyde_attempted`, `hyde_used`, `hyde_coverage_score`, `hyde_query_preview`, `retrieval_query_used`.
+
+- **UI diagnostics expanded**
+  - `ui.py` retrieval diagnostics now shows HyDE attempted/used and alternate coverage score.
+
+- **Founder-answer corpus curation**
+  - Added canonical fact sentence to `data/documents/doc_18.txt`:
+    - “Father Edward Sorin of the Congregation of Holy Cross founded the University of Notre Dame on November 26, 1842.”
+  - Rebuilt `chroma_db` after this update.
+  - Validation now returns the canonical grounded founder answer for `Who founded Notre Dame?`.
