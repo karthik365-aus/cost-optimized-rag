@@ -264,6 +264,29 @@ class RAGPipeline:
         if not factual_hits:
             return None
         q = (query or "").lower()
+        word_to_num = {
+            "zero": "0",
+            "one": "1",
+            "two": "2",
+            "three": "3",
+            "four": "4",
+            "five": "5",
+            "six": "6",
+            "seven": "7",
+            "eight": "8",
+            "nine": "9",
+            "ten": "10",
+            "eleven": "11",
+            "twelve": "12",
+            "thirteen": "13",
+            "fourteen": "14",
+            "fifteen": "15",
+            "sixteen": "16",
+            "seventeen": "17",
+            "eighteen": "18",
+            "nineteen": "19",
+            "twenty": "20",
+        }
         query_tokens = set(re.findall(r"[a-z0-9]+", q))
         stop = {
             "the", "a", "an", "is", "are", "was", "were", "of", "for", "to", "in",
@@ -311,10 +334,29 @@ class RAGPipeline:
             return None
 
         if "how many" in q:
+            subject = re.sub(r"^how many\s+", "", q).strip()
+            subject = re.split(r"\b(is|are|was|were|do|does|did|at|in|for|of|to)\b", subject, maxsplit=1)[0].strip(" ?.,")
             for h in sorted(factual_hits, key=lambda x: overlap_score(x["text"]), reverse=True):
-                m = re.search(r"\b(\d+|one|two|three|four|five|six|seven|eight|nine|ten)\b", h["text"], re.I)
-                if m:
-                    return h["text"]
+                matches = re.findall(
+                    r"\b(\d+|zero|one|two|three|four|five|six|seven|eight|nine|ten|"
+                    r"eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\b",
+                    h["text"],
+                    re.I,
+                )
+                if matches:
+                    values = []
+                    for tok in matches:
+                        t = tok.lower()
+                        if t.isdigit():
+                            values.append(int(t))
+                        elif t in word_to_num:
+                            values.append(int(word_to_num[t]))
+                    if not values:
+                        continue
+                    num = str(max(values))
+                    if subject:
+                        return f"{num} {subject}."
+                    return f"{num}."
         if "when" in q or "what year" in q:
             for h in sorted(factual_hits, key=lambda x: overlap_score(x["text"]), reverse=True):
                 if re.search(r"\b(18|19|20)\d{2}\b", h["text"]):
@@ -589,8 +631,10 @@ class RAGPipeline:
 
         deep_openai_attempted = False
         deep_openai_used = False
+        factual_numeric_answer = bool(use_factual_branch and re.match(r"^\d+\b", (extracted_answer or "").strip()))
         should_deep_openai = (
             not has_session_docs
+            and not factual_numeric_answer
             and (
                 confidence_result.get("confidence_score_final", 1.0) < 0.55
                 or low_quality_answer

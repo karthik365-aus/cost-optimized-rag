@@ -485,3 +485,26 @@ _Appended; all sections above remain as-is._
   - “Father Edward Sorin of the Congregation of Holy Cross founded the University of Notre Dame on November 26, 1842.”
 - Rebuilt index (`chroma_db`) after update.
 - Post-rebuild validation confirms `Who founded Notre Dame?` now returns the canonical grounded sentence via `extractive-factual`.
+
+## Updates — Apr 26, 2026 (numeric factual formatting + Streamlit stability)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` (`how many` extractive answer refinement)
+- Improved extractive formatting for count questions:
+  - maps number words (`one`..`twenty`) to numeric values,
+  - scans all numeric mentions in top factual sentence hits,
+  - selects the strongest numeric signal (max value) to avoid incorrect first-match picks like “one of the five...”.
+- Output now returns concise numeric form when possible (e.g., `5 undergraduate colleges.`) instead of full sentence-only phrasing.
+
+### Deep fallback guard for valid numeric extractive answers
+- Added a guard to prevent deep OpenAI fallback from overriding already-valid extractive numeric answers.
+- Condition: when factual extraction is used and answer starts with a number, skip deep OpenAI retry.
+
+### Runtime validation snapshot
+- Verified query:
+  - `How many undergraduate colleges are at Notre Dame?`
+  - final answer now resolves to numeric extractive output (`5 undergraduate colleges.`) on `extractive-factual` path.
+- Also resolved Streamlit runtime startup instability by launching from project `venv` with:
+  - `--server.fileWatcherType none`
+  - this avoids watcher-related crashes seen under the global/anaconda environment.
