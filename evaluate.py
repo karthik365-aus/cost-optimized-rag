@@ -408,6 +408,12 @@ def run_evaluation(
                     "retrieval_retry_confidence_gate": result.get("retrieval_retry_confidence_gate", ""),
                     "retrieval_avg_chunk_distance": result.get("retrieval_avg_chunk_distance", ""),
                     "retrieval_retry": result.get("retrieval_retry", False),
+                    "factual_fastpath_attempted": result.get("factual_fastpath_attempted", False),
+                    "factual_fastpath_used": result.get("factual_fastpath_used", False),
+                    "rerank_enabled": result.get("rerank_enabled", False),
+                    "rerank_used": result.get("rerank_used", False),
+                    "rerank_model": result.get("rerank_model", ""),
+                    "rerank_latency_ms": result.get("rerank_latency_ms", ""),
                     "original_tokens": result["original_token_count"],
                     "compressed_tokens": result["compressed_token_count"],
                     "compression_ratio": result["compression_ratio"],
@@ -554,6 +560,9 @@ def run_evaluation(
     flan_timeouts = sum(1 for r in rows if r["query_analyzer_llm_status"] == "timeout")
     flan_errors = sum(1 for r in rows if r["query_analyzer_llm_status"] in ("runtime_error", "parse_error"))
     retrieval_retries = sum(1 for r in rows if str(r.get("retrieval_retry")).lower() == "true")
+    factual_fastpath_attempted = sum(1 for r in rows if str(r.get("factual_fastpath_attempted")).lower() == "true")
+    factual_fastpath_used = sum(1 for r in rows if str(r.get("factual_fastpath_used")).lower() == "true")
+    rerank_used = sum(1 for r in rows if str(r.get("rerank_used")).lower() == "true")
     avg_coverage = round(
         sum(float(r["coverage_score"]) for r in rows if str(r["coverage_score"]) != "")
         / max(1, sum(1 for r in rows if str(r["coverage_score"]) != "")),
@@ -651,6 +660,8 @@ def run_evaluation(
     print(f"  FLAN timeouts           : {flan_timeouts}")
     print(f"  FLAN errors             : {flan_errors}")
     print(f"  Retrieval retries       : {retrieval_retries}/{len(rows)}")
+    print(f"  Factual fastpath        : used {factual_fastpath_used}/{len(rows)} (attempted {factual_fastpath_attempted})")
+    print(f"  Cross-encoder rerank    : used {rerank_used}/{len(rows)}")
     print(f"  Avg coverage score      : {avg_coverage}")
     print(f"  Avg compression ratio   : {avg_compression}")
     print(f"  Avg confidence score    : {avg_confidence}")

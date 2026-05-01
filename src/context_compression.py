@@ -55,6 +55,18 @@ class ContextCompressor:
         )
         self.redundancy_threshold = float(os.getenv("COMPRESSION_REDUNDANCY_THRESHOLD", "0.85"))
         self.use_adaptive_budget = os.getenv("COMPRESSION_ADAPTIVE_BUDGET", "true").lower() == "true"
+        loc_env = os.getenv("COMPRESSION_LOCATION_KEYWORDS", "").strip()
+        if loc_env:
+            self.location_keywords = tuple(
+                k.strip().lower() for k in loc_env.split(",") if k.strip()
+            )
+        else:
+            # Generic location cues (avoid corpus-specific geography names).
+            self.location_keywords = (
+                "campus", "building", "hall", "located", "location", "city", "state",
+                "country", "region", "street", "avenue", "district", "near", "beside",
+                "north", "south", "east", "west", "in front of",
+            )
         self._embedding_model = None
         self._embedding_failed = False
 
@@ -126,7 +138,6 @@ class ContextCompressor:
             emb_matrix=emb_matrix,
             budget=budget,
         )
-
         selected_sentences = [sentences[i] for i in selected_idx]
         ranked_for_metadata = list(
             zip(
@@ -303,6 +314,7 @@ class ContextCompressor:
     def _answer_boost(self, query: str, sentence: str) -> float:
         q = (query or "").lower().strip()
         s = sentence or ""
+        s_low = s.lower()
         boost = 0.0
 
         if re.search(r"\bwhen\b|what year|which year|date of", q):
@@ -313,14 +325,13 @@ class ContextCompressor:
             caps = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", s)
             if len(caps) >= 1:
                 boost += 0.06
-
         if re.match(r"where\b", q) or " where " in f" {q} ":
-            loc_kw = (
-                "campus", "building", "hall", "indiana", "notre dame", "located",
-                "south bend", "in front of", "beside", "north", "south", "east", "west",
+            # Generic location cues + proper-noun patterns.
+            has_loc_kw = any(k in s_low for k in self.location_keywords)
+            has_place_pattern = bool(
+                re.search(r"\b(in|at|near|inside|outside)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,3}\b", s)
             )
-            low = s.lower()
-            if any(k in low for k in loc_kw):
+            if has_loc_kw or has_place_pattern:
                 boost += 0.06
 
         if q.startswith("what is") or q.startswith("what was") or "what is the" in q:

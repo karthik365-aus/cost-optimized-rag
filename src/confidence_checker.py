@@ -9,6 +9,8 @@ router used a **local** LM Studio id, the name will not match and **no tier retr
 only scores are returned. Extend ``MODEL_TIERS`` deliberately if you need local retries.
 """
 from typing import Dict, Any
+import os
+import re
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
@@ -23,7 +25,14 @@ load_dotenv()
 # -----------------------------
 # CONFIG
 # -----------------------------
-CONFIDENCE_THRESHOLD = 0.65
+_LEGACY_CONFIDENCE_THRESHOLD = os.getenv("CONFIDENCE_THRESHOLD")
+if _LEGACY_CONFIDENCE_THRESHOLD is not None:
+    # Backward-compatible single threshold override.
+    CONFIDENCE_THRESHOLD_LOCAL = float(_LEGACY_CONFIDENCE_THRESHOLD)
+    CONFIDENCE_THRESHOLD_OPENAI = float(_LEGACY_CONFIDENCE_THRESHOLD)
+else:
+    CONFIDENCE_THRESHOLD_LOCAL = float(os.getenv("CONFIDENCE_THRESHOLD_LOCAL", "0.50"))
+    CONFIDENCE_THRESHOLD_OPENAI = float(os.getenv("CONFIDENCE_THRESHOLD_OPENAI", "0.65"))
 
 _EMBEDDING_MODEL = None
 _EMBEDDING_LOAD_ATTEMPTED = False
@@ -43,16 +52,43 @@ def _get_embedding_model():
         _EMBEDDING_MODEL = None
     return _EMBEDDING_MODEL
 
-# NOTE: Keys must match router `model_used` exactly; local LM Studio ids usually will not match these OpenAI-style names.
-MODEL_TIERS = {
-    "gpt-3.5-turbo": "gpt-4o-mini",
-    "gpt-4o-mini": "gpt-4o",
-}
+def _build_model_tiers() -> Dict[str, str]:
+    """
+    Build retry/escalation map for both local and OpenAI models.
+
+    Local router ids (from env) escalate to gpt-4o-mini by default, while
+    OpenAI tiers keep the existing cascade.
+    """
+    tiers: Dict[str, str] = {
+        "gpt-3.5-turbo": "gpt-4o-mini",
+        "gpt-4o-mini": "gpt-4o",
+    }
+    local_simple = (os.getenv("LOCAL_SIMPLE_MODEL", "") or "").strip()
+    local_medium = (os.getenv("LOCAL_MEDIUM_MODEL", "") or "").strip()
+    local_targets = [local_simple, local_medium]
+    for model_id in local_targets:
+        if not model_id:
+            continue
+        tiers[model_id] = "gpt-4o-mini"
+        # Also support short aliases (e.g., "ministral" from "mistralai/ministral-3-3b").
+        short = model_id.split("/")[-1].strip()
+        if short:
+            tiers[short] = "gpt-4o-mini"
+    return tiers
+
+
+def _select_confidence_threshold(model_used: str, router_output: Dict[str, Any]) -> float:
+    source = (router_output or {}).get("model_source", "")
+    source = source.lower().strip()
+    model_used = (model_used or "").lower().strip()
+    if source == "openai" or model_used.startswith("gpt-"):
+        return CONFIDENCE_THRESHOLD_OPENAI
+    return CONFIDENCE_THRESHOLD_LOCAL
 
 # -----------------------------
 # HEURISTIC SCORING
 # -----------------------------
-def heuristic_score(answer: str, context: str) -> float:
+def heuristic_score(answer: str, context: str, complexity: str = "medium") -> float:
     if not answer or len(answer.strip()) == 0:
         return 0.0
 
@@ -68,7 +104,8 @@ def heuristic_score(answer: str, context: str) -> float:
     if any(p in answer_lower for p in bad_phrases):
         return 0.2
 
-    length_score = min(len(answer.split()) / 20, 1.0)
+    length_target = {"simple": 10, "medium": 20, "complex": 40}.get((complexity or "medium").strip().lower(), 20)
+    length_score = min(len(answer.split()) / max(1, length_target), 1.0)
     context_words = set(context.lower().split())
     answer_words = set(answer_lower.split())
     if len(answer_words) == 0:
@@ -103,10 +140,24 @@ def embedding_similarity(answer: str, context: str) -> float:
     if model is None:
         return 0.0
     try:
-        emb_answer = model.encode(answer, convert_to_numpy=True).reshape(1, -1)
-        emb_context = model.encode(context, convert_to_numpy=True).reshape(1, -1)
-        score = cosine_similarity(emb_answer, emb_context)[0][0]
-        return float(np.clip(score, 0.0, 1.0))
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", context)
+            if len(s.strip()) > 15
+        ]
+        if not sentences:
+            sentences = [context.strip()]
+
+        all_texts = [answer.strip()] + sentences
+        embs = model.encode(all_texts, convert_to_numpy=True)
+        embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+        answer_emb = embs[0:1]
+        context_embs = embs[1:]
+
+        sims = cosine_similarity(answer_emb, context_embs).flatten()
+        if sims.size == 0:
+            return 0.0
+        return float(np.clip(np.max(sims), 0.0, 1.0))
     except Exception as e:
         print(f"[ConfidenceChecker] Embedding similarity failed: {e}")
         return 0.0
@@ -164,7 +215,7 @@ def check_confidence(
     analyzer_source = (analyzer_output or {}).get("source")
 
     # Step 1 — heuristic score
-    heuristic = heuristic_score(answer, compressed_context)
+    heuristic = heuristic_score(answer, compressed_context, complexity)
 
     # Step 2 — TF-IDF score
     tfidf = tfidf_similarity(answer, compressed_context)
@@ -177,27 +228,29 @@ def check_confidence(
 
     # Final confidence = 70% semantic + 30% heuristic
     confidence_score_original = round(0.7 * semantic_score + 0.3 * heuristic, 2)
+    confidence_threshold = _select_confidence_threshold(model_used_original, router_output)
 
     retried = False
     retry_reason = None
     model_used_final = model_used_original
     confidence_score_final = confidence_score_original
+    model_tiers = _build_model_tiers()
 
     # Step 4 — retry if low confidence
-    if confidence_score_final < CONFIDENCE_THRESHOLD and model_used_original in MODEL_TIERS:
+    if confidence_score_final < confidence_threshold and model_used_original in model_tiers:
         retried = True
         low_scores = []
-        if heuristic < CONFIDENCE_THRESHOLD:
+        if heuristic < confidence_threshold:
             low_scores.append(f"heuristic={heuristic}")
-        if tfidf < CONFIDENCE_THRESHOLD:
+        if tfidf < confidence_threshold:
             low_scores.append(f"tfidf={tfidf}")
-        if embed < CONFIDENCE_THRESHOLD:
+        if embed < confidence_threshold:
             low_scores.append(f"embedding={embed}")
-        retry_reason = f"confidence {confidence_score_original} < threshold {CONFIDENCE_THRESHOLD}" + (
+        retry_reason = f"confidence {confidence_score_original} < threshold {confidence_threshold}" + (
             f" (low: {', '.join(low_scores)})" if low_scores else ""
         )
 
-        stronger_model = MODEL_TIERS[model_used_original]
+        stronger_model = model_tiers[model_used_original]
         try:
             new_answer = retry_with_stronger_model(
                 query=query,
@@ -206,7 +259,7 @@ def check_confidence(
             )
 
             # recompute scores
-            heuristic_new = heuristic_score(new_answer, compressed_context)
+            heuristic_new = heuristic_score(new_answer, compressed_context, complexity)
             tfidf_new = tfidf_similarity(new_answer, compressed_context)
             embed_new = embedding_similarity(new_answer, compressed_context)
             semantic_new = 0.5 * tfidf_new + 0.5 * embed_new
@@ -232,7 +285,9 @@ def check_confidence(
         "analyzer_confidence": analyzer_confidence,
         "analyzer_source": analyzer_source,
         "answer_complexity": complexity,
-        "confidence_threshold": CONFIDENCE_THRESHOLD,
+        "confidence_threshold": confidence_threshold,
+        "confidence_threshold_local": CONFIDENCE_THRESHOLD_LOCAL,
+        "confidence_threshold_openai": CONFIDENCE_THRESHOLD_OPENAI,
         "confidence_checker_embedding_enabled": _EMBEDDING_MODEL is not None,
         "confidence_semantic": semantic,
         "score_breakdown": {

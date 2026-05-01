@@ -62,6 +62,17 @@ class RAGPipeline:
     USE_HYDE = os.getenv("USE_HYDE", "false").lower() == "true"
     HYDE_MIN_COVERAGE_GAIN = float(os.getenv("HYDE_MIN_COVERAGE_GAIN", "0.03"))
     HYDE_MAX_CHARS = int(os.getenv("HYDE_MAX_CHARS", "700"))
+    MAX_HEAVY_FALLBACKS = int(os.getenv("PIPELINE_MAX_HEAVY_FALLBACKS", "1"))
+    DEEP_OPENAI_MIN_COVERAGE = float(os.getenv("DEEP_OPENAI_MIN_COVERAGE", "0.40"))
+    PROTECTED_FACTUAL_PREFIXES = (
+        "how many ",
+        "who ",
+        "when ",
+        "where ",
+        "which ",
+        "what is ",
+        "what was ",
+    )
 
     def _build_vocab_index(self) -> dict[str, set[str]]:
         if self._vocab_index_cache is not None:
@@ -100,6 +111,12 @@ class RAGPipeline:
                     return token
             close = difflib.get_close_matches(token, candidates, n=1, cutoff=0.78)
             return close[0] if close else token
+
+        for prefix in self.PROTECTED_FACTUAL_PREFIXES:
+            if normalized_query.startswith(prefix):
+                suffix = normalized_query[len(prefix):]
+                corrected_suffix = re.sub(r"[a-z]+", _replace, suffix)
+                return f"{prefix}{corrected_suffix}".strip()
 
         return re.sub(r"[a-z]+", _replace, normalized_query)
 
@@ -420,15 +437,58 @@ class RAGPipeline:
             f"(confidence={analysis['confidence']}, source={analysis['source']}, llm_status={analysis['llm_status']})"
         )
 
-        # Step 2 — Retrieve relevant chunks (optional HyDE alternate query)
+        # Step 2 — Retrieve relevant chunks (optional analyzer-triggered factual fast path, then optional HyDE)
         t0 = time.perf_counter()
         retrieval_query = corrected_query or normalized_query or query
-        retrieval = self.retriever.retrieve(
-            query=retrieval_query,
-            complexity=complexity,
-            complexity_score=analysis.get("complexity_score"),
-            analyzer_confidence=analysis.get("confidence"),
+        reason_codes = set(analysis.get("reason_codes") or [])
+        complexity_score_val = float(analysis.get("complexity_score") or 0.0)
+        factual_fastpath_attempted = False
+        factual_fastpath_used = False
+        factual_fastpath_hits = []
+        factual_fastpath_answer = None
+        should_factual_fastpath = (
+            not has_session_docs
+            and ("simple_starter" in reason_codes)
+            and (complexity_score_val < 0.30)
+            and self._is_factual_query(normalized_query or query)
         )
+        if should_factual_fastpath:
+            factual_fastpath_attempted = True
+            factual_fastpath_hits = self.retriever.retrieve_factual_sentences(
+                normalized_query or query,
+                top_n=20,
+            )
+            factual_fastpath_answer = self._extractive_answer(normalized_query or query, factual_fastpath_hits)
+            if factual_fastpath_answer:
+                factual_fastpath_used = True
+                retrieval = {
+                    "docs": [],
+                    "k": 0,
+                    "complexity_used": complexity,
+                    "complexity_score_used": round(complexity_score_val, 2),
+                    "analyzer_confidence": analysis.get("confidence"),
+                    "k_base": 0,
+                    "k_final": 0,
+                    "coverage_score": 1.0,
+                    "coverage_threshold_used": None,
+                    "retry_confidence_gate_used": None,
+                    "retrieval_retry": False,
+                    "chunks": [],
+                    "rerank_enabled": False,
+                    "rerank_used": False,
+                    "rerank_model": "",
+                    "rerank_latency_ms": 0.0,
+                }
+                print("[FactualFastPath] Using sentence-index extraction path; skipping Chroma retrieval.")
+            else:
+                print("[FactualFastPath] No strong extractive hit; falling back to standard retrieval.")
+        if not factual_fastpath_used:
+            retrieval = self.retriever.retrieve(
+                query=retrieval_query,
+                complexity=complexity,
+                complexity_score=analysis.get("complexity_score"),
+                analyzer_confidence=analysis.get("confidence"),
+            )
         hyde_attempted = False
         hyde_used = False
         hyde_query = ""
@@ -436,6 +496,7 @@ class RAGPipeline:
         if (
             self.USE_HYDE
             and not has_session_docs
+            and not factual_fastpath_used
             and self._is_factual_query(normalized_query or query)
         ):
             hyde_attempted = True
@@ -472,6 +533,8 @@ class RAGPipeline:
             "hyde_query_preview": (hyde_query[:200] if hyde_query else ""),
             "hyde_coverage_score": hyde_coverage,
             "retrieval_query_used": retrieval_query_used,
+            "factual_fastpath_attempted": factual_fastpath_attempted,
+            "factual_fastpath_used": factual_fastpath_used,
         }
         retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
         docs = retrieval["docs"]
@@ -507,7 +570,11 @@ class RAGPipeline:
         use_factual_branch = False
         factual_hits = []
         extracted_answer = None
-        if self._is_factual_query(normalized_query or query):
+        if factual_fastpath_used:
+            factual_hits = factual_fastpath_hits
+            extracted_answer = factual_fastpath_answer
+            use_factual_branch = True
+        elif self._is_factual_query(normalized_query or query):
             factual_hits = self.retriever.retrieve_factual_sentences(
                 normalized_query or query,
                 top_n=20,
@@ -576,13 +643,18 @@ class RAGPipeline:
             print(f"Initial answer: {router_result['answer']}")
 
         # Step 5 — Confidence check and retry if needed
-        t0 = time.perf_counter()
+        t_conf = time.perf_counter()
         confidence_result = check_confidence(
             query=corrected_query or normalized_query or query,
             compressed_context=compression["compressed_context"],
             router_output=router_result,
             analyzer_output=analysis,
         )
+        confidence_scoring_ms = round((time.perf_counter() - t_conf) * 1000, 2)
+        robust_retry_ms = 0.0
+        deep_openai_ms = 0.0
+        grounding_fallback_ms = 0.0
+        heavy_fallbacks_used = 0
         low_quality_answer = any(
             marker in (confidence_result.get("final_answer", "").lower())
             for marker in ["does not provide information", "insufficient", "could you clarify", "not enough context"]
@@ -597,8 +669,11 @@ class RAGPipeline:
                 or (confidence_result.get("confidence_score_final", 1.0) < 0.60 and low_quality_answer)
             )
             and not retrieval.get("retrieval_retry", False)
+            and heavy_fallbacks_used < self.MAX_HEAVY_FALLBACKS
         )
         if should_retry_robust:
+            t_robust = time.perf_counter()
+            heavy_fallbacks_used += 1
             print("Low-quality signal detected. Running typo-tolerant retrieval retry...")
             robust_query = self._build_query_variants(query, normalized_query, corrected_query)[-1]
             robust_retrieval = self.retriever.retrieve(
@@ -628,20 +703,38 @@ class RAGPipeline:
                 compression = robust_compression
                 router_result = robust_router
                 confidence_result = robust_confidence
+            robust_retry_ms = round((time.perf_counter() - t_robust) * 1000, 2)
 
         deep_openai_attempted = False
         deep_openai_used = False
         factual_numeric_answer = bool(use_factual_branch and re.match(r"^\d+\b", (extracted_answer or "").strip()))
-        should_deep_openai = (
+        deep_openai_low_quality_signal = (
+            confidence_result.get("confidence_score_final", 1.0) < 0.55
+            or low_quality_answer
+        )
+        deep_openai_api_available = bool(os.getenv("OPENAI_API_KEY", "").strip())
+        deep_openai_base_eligible = (
             not has_session_docs
             and not factual_numeric_answer
-            and (
-                confidence_result.get("confidence_score_final", 1.0) < 0.55
-                or low_quality_answer
-            )
-            and bool(os.getenv("OPENAI_API_KEY", "").strip())
+            and deep_openai_low_quality_signal
+            and deep_openai_api_available
+            and heavy_fallbacks_used < self.MAX_HEAVY_FALLBACKS
         )
+        deep_openai_coverage = float(retrieval.get("coverage_score", 0.0) or 0.0)
+        should_deep_openai = (
+            deep_openai_base_eligible
+            and deep_openai_coverage >= self.DEEP_OPENAI_MIN_COVERAGE
+        )
+        if deep_openai_base_eligible and not should_deep_openai:
+            print(
+                "[Pipeline] Skipping deep OpenAI fallback — "
+                f"coverage_score={round(deep_openai_coverage, 4)} below "
+                f"DEEP_OPENAI_MIN_COVERAGE={self.DEEP_OPENAI_MIN_COVERAGE}. "
+                "Corpus likely lacks relevant content for this query."
+            )
         if should_deep_openai:
+            t_deep_openai = time.perf_counter()
+            heavy_fallbacks_used += 1
             deep_openai_attempted = True
             print("Low-quality signal persists. Running deep retrieval with OpenAI and no compression...")
             try:
@@ -686,7 +779,9 @@ class RAGPipeline:
                     deep_openai_used = True
             except Exception as exc:
                 print(f"[Pipeline] Deep OpenAI fallback failed: {type(exc).__name__}: {exc}")
+            deep_openai_ms = round((time.perf_counter() - t_deep_openai) * 1000, 2)
 
+        t_grounding = time.perf_counter()
         grounded_ok, grounding_meta = self._grounding_gate(
             confidence_result.get("final_answer", ""),
             compression.get("compressed_context", ""),
@@ -697,8 +792,10 @@ class RAGPipeline:
             can_escalate_openai = (
                 router_result.get("model_source") == "local_openai_compatible"
                 and bool(os.getenv("OPENAI_API_KEY", "").strip())
+                and heavy_fallbacks_used < self.MAX_HEAVY_FALLBACKS
             )
             if can_escalate_openai:
+                heavy_fallbacks_used += 1
                 openai_fallback_attempted = True
                 try:
                     openai_router_result = self.router.route(
@@ -736,7 +833,11 @@ class RAGPipeline:
                 confidence_result["retry_reason"] = (
                     (confidence_result.get("retry_reason") or "") + " | grounding_gate"
                 ).strip(" |")
-        confidence_checker_ms = round((time.perf_counter() - t0) * 1000, 2)
+        grounding_fallback_ms = round((time.perf_counter() - t_grounding) * 1000, 2)
+        confidence_checker_ms = round(
+            confidence_scoring_ms + robust_retry_ms + deep_openai_ms + grounding_fallback_ms,
+            2,
+        )
         breakdown = confidence_result["score_breakdown"]
         print(f"Score breakdown — heuristic: {breakdown['heuristic']} | tfidf: {breakdown['tfidf']} | embedding: {breakdown['embedding']} | semantic: {breakdown['semantic']}")
         print(f"Confidence: {confidence_result['confidence_score_final']} | Retried: {confidence_result['retried']}" + (f" | Reason: {confidence_result['retry_reason']}" if confidence_result["retried"] else ""))
@@ -746,22 +847,25 @@ class RAGPipeline:
         print(
             f"Stage timing (ms) — analyzer: {query_analyzer_ms} | retrieval: {retrieval_ms} | "
             f"compression: {compression_ms} | router: {model_router_ms} | "
-            f"confidence_checker: {confidence_checker_ms} | total: {total_pipeline_ms}"
+            f"confidence_checker: {confidence_checker_ms} "
+            f"(score={confidence_scoring_ms}, robust={robust_retry_ms}, deep_openai={deep_openai_ms}, grounding={grounding_fallback_ms}) "
+            f"| total: {total_pipeline_ms}"
         )
 
         _chunks = retrieval.get("chunks") or []
+        _chunk_distances = []
+        for c in _chunks:
+            raw = c.get("chroma_distance", c.get("similarity_score", ""))
+            try:
+                _chunk_distances.append(float(raw))
+            except (TypeError, ValueError):
+                continue
         _retrieval_avg_chunk_metric = (
             round(
-                sum(
-                    float(
-                        c.get("chroma_distance", c.get("similarity_score", 0.0))
-                    )
-                    for c in _chunks
-                )
-                / len(_chunks),
+                sum(_chunk_distances) / len(_chunk_distances),
                 4,
             )
-            if _chunks
+            if _chunk_distances
             else ""
         )
         _tok_orig = int(compression.get("original_token_count") or 0)
@@ -788,6 +892,10 @@ class RAGPipeline:
             "compression_ms": compression_ms,
             "model_router_ms": model_router_ms,
             "confidence_checker_ms": confidence_checker_ms,
+            "confidence_scoring_ms": confidence_scoring_ms,
+            "robust_retry_ms": robust_retry_ms,
+            "deep_openai_ms": deep_openai_ms,
+            "grounding_fallback_ms": grounding_fallback_ms,
             "total_pipeline_ms": total_pipeline_ms,
             # retrieval metadata
             "k": retrieval["k"],
@@ -800,11 +908,17 @@ class RAGPipeline:
             "retrieval_retry": retrieval["retrieval_retry"],
             "coverage_threshold_used": retrieval.get("coverage_threshold_used"),
             "retrieval_retry_confidence_gate": retrieval.get("retry_confidence_gate_used"),
+            "rerank_enabled": retrieval.get("rerank_enabled", False),
+            "rerank_used": retrieval.get("rerank_used", False),
+            "rerank_model": retrieval.get("rerank_model", ""),
+            "rerank_latency_ms": retrieval.get("rerank_latency_ms", 0.0),
             "hyde_attempted": retrieval.get("hyde_attempted", False),
             "hyde_used": retrieval.get("hyde_used", False),
             "hyde_query_preview": retrieval.get("hyde_query_preview", ""),
             "hyde_coverage_score": retrieval.get("hyde_coverage_score"),
             "retrieval_query_used": retrieval.get("retrieval_query_used", retrieval_query),
+            "factual_fastpath_attempted": retrieval.get("factual_fastpath_attempted", False),
+            "factual_fastpath_used": retrieval.get("factual_fastpath_used", False),
             "retrieval_avg_chunk_distance": _retrieval_avg_chunk_metric,
             "chunks": retrieval["chunks"],
             # compression metadata
@@ -848,6 +962,8 @@ class RAGPipeline:
             "openai_fallback_used": openai_fallback_used,
             "deep_openai_attempted": deep_openai_attempted,
             "deep_openai_used": deep_openai_used,
+            "max_heavy_fallbacks": self.MAX_HEAVY_FALLBACKS,
+            "heavy_fallbacks_used": heavy_fallbacks_used,
             "cache_hit": False,
         }
         top_factual_hits = [
@@ -868,9 +984,15 @@ class RAGPipeline:
             "k_final": retrieval.get("k_final"),
             "coverage_score": retrieval.get("coverage_score"),
             "retrieval_retry": retrieval.get("retrieval_retry"),
+            "rerank_enabled": retrieval.get("rerank_enabled", False),
+            "rerank_used": retrieval.get("rerank_used", False),
+            "rerank_model": retrieval.get("rerank_model", ""),
+            "rerank_latency_ms": retrieval.get("rerank_latency_ms", 0.0),
             "hyde_attempted": retrieval.get("hyde_attempted", False),
             "hyde_used": retrieval.get("hyde_used", False),
             "hyde_coverage_score": retrieval.get("hyde_coverage_score"),
+            "factual_fastpath_attempted": retrieval.get("factual_fastpath_attempted", False),
+            "factual_fastpath_used": retrieval.get("factual_fastpath_used", False),
             "retrieval_sources_top5": [
                 {
                     "source": c.get("source", "unknown"),
@@ -884,6 +1006,8 @@ class RAGPipeline:
             "openai_fallback_used": openai_fallback_used,
             "deep_openai_attempted": deep_openai_attempted,
             "deep_openai_used": deep_openai_used,
+            "max_heavy_fallbacks": self.MAX_HEAVY_FALLBACKS,
+            "heavy_fallbacks_used": heavy_fallbacks_used,
             "cache_hit": False,
         }
         if not has_session_docs:

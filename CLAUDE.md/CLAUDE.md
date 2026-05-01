@@ -508,3 +508,201 @@ _Appended; all sections above remain as-is._
 - Also resolved Streamlit runtime startup instability by launching from project `venv` with:
   - `--server.fileWatcherType none`
   - this avoids watcher-related crashes seen under the global/anaconda environment.
+
+## Updates — May 1, 2026 (retrieval reranker + confidence checker reliability tuning)
+
+_Appended; all sections above remain as-is._
+
+### `src/adaptive_retriever.py` (cross-encoder second-stage reranking)
+- Added optional cross-encoder reranking after hybrid merge and before compression input:
+  - model: `cross-encoder/ms-marco-MiniLM-L-6-v2`
+  - candidate cap: `CROSS_ENCODER_CANDIDATES` (default `20`)
+  - flag: `USE_CROSS_ENCODER_RERANK` (default `true`)
+- Kept current dense+lexical hybrid as candidate generation and bounded reranking to top candidates only.
+- Added safe fallback behavior when cross-encoder load/inference fails.
+- Added retrieval metadata for observability:
+  - `rerank_enabled`, `rerank_used`, `rerank_model`, `rerank_latency_ms`
+  - chunk-level `cross_encoder_score` + `retrieval_mode` suffix `+cross_encoder`.
+
+### `src/pipeline.py` (rerank observability propagation)
+- Extended pipeline result and `retrieval_diagnostics` to include reranker fields:
+  - `rerank_enabled`, `rerank_used`, `rerank_model`, `rerank_latency_ms`.
+
+### `src/confidence_checker.py` (retry behavior fixes + scoring fairness)
+- Fixed local-model retry dead-path by expanding model tier mapping:
+  - dynamically map `LOCAL_SIMPLE_MODEL` and `LOCAL_MEDIUM_MODEL` to `gpt-4o-mini`,
+  - keep OpenAI escalation path (`gpt-3.5-turbo -> gpt-4o-mini -> gpt-4o`),
+  - include short alias support from model IDs.
+- Added threshold configurability with local/openai split:
+  - `CONFIDENCE_THRESHOLD_LOCAL` (default `0.50`)
+  - `CONFIDENCE_THRESHOLD_OPENAI` (default `0.65`)
+  - backward-compatible `CONFIDENCE_THRESHOLD` override still supported.
+- Implemented complexity-aware heuristic length normalization:
+  - simple/medium/complex targets: `10/20/40`.
+- Upgraded embedding similarity from global context vector to sentence-level max pooling:
+  - answer embedding is compared against each context sentence embedding,
+  - final embedding score uses max sentence match for factual grounding.
+
+### `src/model_router.py` (local model cache hygiene)
+- Added TTL-based refresh for local model cache to avoid stale `/v1/models` state when LM Studio hot-reloads:
+  - `LOCAL_MODELS_CACHE_TTL_SECONDS` (default `60`).
+
+### Runtime checks performed
+- Compile + lint checks passed for touched files.
+- Smoke tests confirmed:
+  - local-model confidence retry can now escalate to OpenAI tier when needed,
+  - local/openai thresholds are selected correctly,
+  - cross-encoder reranker is active and observable in retrieval metadata.
+
+## Updates — May 1, 2026 (analyzer-driven factual fast path + compression generalization)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` (QueryAnalyzer-triggered factual fast path)
+- Added a first-class factual fast path that can bypass Chroma retrieval and go directly to sentence-index extraction when all of the following hold:
+  - `simple_starter` present in `analysis.reason_codes`,
+  - `complexity_score < 0.30`,
+  - factual-query pattern check passes,
+  - no session-uploaded documents are attached.
+- Behavior:
+  - if strong extractive answer is found from `retrieve_factual_sentences(...)`, pipeline skips vector retrieval and proceeds with extractive-factual path;
+  - otherwise falls back safely to normal hybrid retrieval.
+- Added result + diagnostics fields:
+  - `factual_fastpath_attempted`
+  - `factual_fastpath_used`
+
+### `src/context_compression.py` (`_answer_boost` de-corpus-ified)
+- Replaced corpus-specific location keywords with generic/default location cues.
+- Added env override:
+  - `COMPRESSION_LOCATION_KEYWORDS` (comma-separated) for corpus-specific customization when needed.
+- Added generic place-pattern detection (proper-noun phrase after location prepositions) for `where`-type boosts.
+
+### `src/pipeline.py` robustness fix (retrieval distance metric)
+- Fixed `retrieval_avg_chunk_distance` aggregation to skip non-numeric chunk distance values (e.g., lexical chunks with empty distance fields), avoiding `float('')` errors in mixed retrieval mode.
+
+### Validation snapshot
+- Compile + lint passed for updated files.
+- Smoke checks confirm:
+  - founder query uses factual fast path and returns grounded canonical sentence with retrieval bypass,
+  - `how many` query still returns numeric extractive answer,
+  - non-factual comparative queries continue through standard retrieval/compression/router path.
+
+## Updates — May 1, 2026 (benchmark instrumentation + factual fastpath impact validation)
+
+_Appended; all sections above remain as-is._
+
+### `evaluate.py` instrumentation updates
+- Added new exported CSV/JSON fields for analysis:
+  - `factual_fastpath_attempted`
+  - `factual_fastpath_used`
+  - `rerank_enabled`, `rerank_used`, `rerank_model`, `rerank_latency_ms`
+- Extended end-of-run summary to print:
+  - factual fastpath usage (used/attempted counts),
+  - cross-encoder rerank usage count.
+
+### Full 50-query benchmark run
+- Executed benchmark with:
+  - `evaluate.py --queries data/test_queries.csv`
+  - outputs:
+    - `results/may1_fastpath/evaluation_results.csv`
+    - `results/may1_fastpath/evaluation_results.json`
+- Run summary highlights:
+  - total queries: `50`
+  - factual fastpath: `used 12/50` (attempted `12`)
+  - cross-encoder rerank used: `38/50`
+  - retrieval retries: `4/50`
+  - model reroutes: `15/50`
+
+### Factual fastpath impact (computed from benchmark CSV)
+- Average total pipeline latency:
+  - fastpath used: `171.38 ms`
+  - fastpath not used: `11211.90 ms`
+- Average retrieval latency:
+  - fastpath used: `3.29 ms`
+  - fastpath not used: `572.60 ms`
+- Average confidence:
+  - fastpath used: `0.79`
+  - fastpath not used: `0.54`
+- Fastpath usage concentrated on simple queries:
+  - simple: `12`
+  - medium: `0`
+  - complex: `0`
+
+## Updates — May 1, 2026 (fallback-chain cap + timing split + starter protection + rerank policy)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` (confidence-stage timing split)
+- Split confidence-stage timing into explicit sub-metrics:
+  - `confidence_scoring_ms`
+  - `robust_retry_ms`
+  - `deep_openai_ms`
+  - `grounding_fallback_ms`
+- Kept `confidence_checker_ms` as aggregate of the four sub-metrics for backward-compatible dashboards/reports.
+- Updated stage timing log line to print confidence sub-breakdown.
+
+### `src/pipeline.py` (protect factual starters before spell-correction)
+- Added starter protection so spell-correction does not alter factual query prefixes:
+  - `how many`, `who`, `when`, `where`, `which`, `what is`, `what was`.
+- Behavior change: only the suffix after a protected factual prefix is spell-corrected.
+
+### `src/adaptive_retriever.py` (selective cross-encoder policy, env-gated)
+- Added per-query rerank gate:
+  - rerank enabled for `medium/complex`,
+  - simple queries rerank only when `RERANK_SIMPLE_QUERIES=true`.
+- New env:
+  - `RERANK_SIMPLE_QUERIES` (default `false`).
+- Retrieval metadata now reflects effective per-query rerank decision (`rerank_enabled`, `rerank_model`, etc.).
+
+### `src/pipeline.py` (fallback-chain depth cap, env-gated)
+- Added global heavy-fallback cap across:
+  - typo-tolerant robust retry,
+  - deep OpenAI fallback,
+  - grounding-gate OpenAI fallback.
+- New env:
+  - `PIPELINE_MAX_HEAVY_FALLBACKS` (default `1`).
+- Added observability fields:
+  - `max_heavy_fallbacks`
+  - `heavy_fallbacks_used`.
+
+### Validation — fallback cap A/B (cap=1 vs cap=2)
+- **Slice A (50-query subset)**:
+  - accuracy (evaluable): unchanged (`50.0%` vs `50.0%`),
+  - paired average latency delta (`cap2 - cap1`): approximately `-171.79 ms` on this run (no accuracy gain).
+- **Slice B (hard subset, 29 queries)**:
+  - hard subset built from reroute/retry/non-simple signals;
+  - single-run result: accuracy unchanged (`88.89%` evaluable), paired average latency delta (`cap2 - cap1`) approximately `+2755.87 ms`.
+- **Stability check (3 repeated hard-slice runs per cap)**:
+  - accuracy unchanged in all runs (`88.89%` evaluable for both caps),
+  - paired mean latency delta (`cap2 - cap1`): approximately `+931.34 ms` (std `1582.09`),
+  - `cap=2` showed higher confidence-stage latency variance.
+
+### Decision from validation
+- Keep default:
+  - `PIPELINE_MAX_HEAVY_FALLBACKS=1`
+- Rationale:
+  - no observed accuracy lift from cap `2`,
+  - higher/less stable latency and potential extra fallback cost with cap `2`.
+
+## Updates — May 1, 2026 (deep OpenAI fallback coverage gate)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` (coverage-aware deep fallback gate)
+- Added env-gated minimum coverage requirement before deep OpenAI fallback can run:
+  - `DEEP_OPENAI_MIN_COVERAGE` (default `0.40`).
+- Deep fallback now requires:
+  - existing low-quality eligibility + API/cap checks, and
+  - `retrieval.coverage_score >= DEEP_OPENAI_MIN_COVERAGE`.
+- Added explicit skip log when deep fallback is otherwise eligible but blocked by low coverage:
+  - includes current `coverage_score` and configured threshold.
+
+### `.env.example` update
+- Added:
+  - `DEEP_OPENAI_MIN_COVERAGE=0.40`
+- Comment clarifies behavior:
+  - skip deep OpenAI fallback when corpus coverage is below threshold.
+
+### Quick verification
+- `src/pipeline.py` compiles successfully (`py_compile`).
+- Lint check passed for touched files.

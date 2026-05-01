@@ -52,8 +52,10 @@ class ModelRouter:
         self.local_openai_api_key = os.getenv("LOCAL_OPENAI_API_KEY", "lm-studio")
         self.local_healthcheck_enabled = os.getenv("LOCAL_HEALTHCHECK_ENABLED", "true").lower() == "true"
         self.local_healthcheck_timeout = float(os.getenv("LOCAL_HEALTHCHECK_TIMEOUT_SECONDS", "3"))
+        self.local_models_cache_ttl_seconds = float(os.getenv("LOCAL_MODELS_CACHE_TTL_SECONDS", "60"))
         self.temperature = temperature
         self._local_models_cache: Optional[set[str]] = None
+        self._local_models_cache_fetched_at: float = 0.0
 
     def route(
         self,
@@ -137,8 +139,14 @@ class ModelRouter:
         return answer
 
     def _ensure_local_model_available(self, model_name: str) -> None:
-        if self._local_models_cache is None:
+        now = time.time()
+        cache_expired = (
+            self._local_models_cache is None
+            or (now - self._local_models_cache_fetched_at) >= self.local_models_cache_ttl_seconds
+        )
+        if cache_expired:
             self._local_models_cache = self._fetch_local_models()
+            self._local_models_cache_fetched_at = now
         if model_name in self._local_models_cache:
             return
         available = ", ".join(sorted(self._local_models_cache)) if self._local_models_cache else "(none)"

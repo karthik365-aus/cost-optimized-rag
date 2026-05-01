@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import time
 from typing import List, Tuple
 
 from dotenv import load_dotenv
@@ -24,6 +25,7 @@ except Exception:  # optional dependency; fallback splitter remains available
     SemanticChunker = None
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
@@ -48,6 +50,12 @@ class AdaptiveRetriever:
     MMR_LAMBDA = 0.75
     MMR_FETCH_K_MIN = 12
     MMR_FETCH_K_MAX = 40
+
+    # Optional second-stage cross-encoder reranking
+    USE_CROSS_ENCODER_RERANK = os.getenv("USE_CROSS_ENCODER_RERANK", "true").lower() == "true"
+    RERANK_SIMPLE_QUERIES = os.getenv("RERANK_SIMPLE_QUERIES", "false").lower() == "true"
+    CROSS_ENCODER_MODEL = os.getenv("CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+    CROSS_ENCODER_CANDIDATES = int(os.getenv("CROSS_ENCODER_CANDIDATES", "20"))
 
     # Chunking defaults (shorter, more semantic windows)
     CHUNK_SIZE = int(os.getenv("RETRIEVER_CHUNK_SIZE", "450"))
@@ -75,6 +83,8 @@ class AdaptiveRetriever:
         self._factual_sentences = []
         self._factual_vectorizer = None
         self._factual_matrix = None
+        self._cross_encoder = None
+        self._cross_encoder_failed = False
         self._embeddings = HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
             encode_kwargs={"normalize_embeddings": True},
@@ -116,12 +126,20 @@ class AdaptiveRetriever:
             k_final = k_base
         else:
             k_final = min(k_base + self.LOW_CONF_BONUS, self.K_HARD_CAP) if low_confidence else k_base
+        rerank_enabled_for_query = (
+            self.USE_CROSS_ENCODER_RERANK
+            and (normalized_complexity != "simple" or self.RERANK_SIMPLE_QUERIES)
+        )
         print(
             f"Retrieving {k_final} chunks for {normalized_complexity} query "
             f"(score={round(score, 2)}, confidence={analyzer_confidence})..."
         )
 
-        docs, chunks_metadata = self._hybrid_retrieve(query=query, k_select=k_final)
+        docs, chunks_metadata = self._hybrid_retrieve(
+            query=query,
+            k_select=k_final,
+            rerank_enabled=rerank_enabled_for_query,
+        )
         coverage_score = self._keyword_coverage_score(query=query, docs=docs)
         retrieval_retry = False
         coverage_threshold = self.COVERAGE_THRESHOLDS.get(normalized_complexity, 0.50)
@@ -129,7 +147,11 @@ class AdaptiveRetriever:
 
         if force_k is None and coverage_score < coverage_threshold and low_confidence_for_retry and k_final < self.K_HARD_CAP:
             retry_k = min(k_final + self.RETRY_BONUS, self.K_HARD_CAP)
-            docs, chunks_metadata = self._hybrid_retrieve(query=query, k_select=retry_k)
+            docs, chunks_metadata = self._hybrid_retrieve(
+                query=query,
+                k_select=retry_k,
+                rerank_enabled=rerank_enabled_for_query,
+            )
             k_final = retry_k
             coverage_score = self._keyword_coverage_score(query=query, docs=docs)
             retrieval_retry = True
@@ -149,14 +171,29 @@ class AdaptiveRetriever:
             "coverage_threshold_used": coverage_threshold,
             "retry_confidence_gate_used": self.RETRY_CONFIDENCE_GATE,
             "retrieval_retry": retrieval_retry,
+            "rerank_enabled": rerank_enabled_for_query,
+            "rerank_used": any("cross_encoder_score" in c for c in chunks_metadata),
+            "rerank_model": self.CROSS_ENCODER_MODEL if rerank_enabled_for_query else "",
+            "rerank_latency_ms": round(
+                sum(float(c.get("rerank_latency_ms", 0.0)) for c in chunks_metadata) / max(1, len(chunks_metadata)),
+                2,
+            ) if chunks_metadata else 0.0,
             "chunks": chunks_metadata,
         }
 
-    def _hybrid_retrieve(self, query: str, k_select: int) -> Tuple[List, List]:
+    def _hybrid_retrieve(self, query: str, k_select: int, rerank_enabled: bool) -> Tuple[List, List]:
         fetch_k = min(self.K_HARD_CAP, max(k_select, k_select + self.CANDIDATE_EXTRA))
         dense_docs, dense_meta = self._run_dense_retrieval(query=query, k=fetch_k)
         lexical_docs, lexical_meta = self._run_lexical_retrieval(query=query, k=fetch_k)
-        return self._merge_hybrid(dense_docs, dense_meta, lexical_docs, lexical_meta, k_select)
+        return self._merge_hybrid(
+            query,
+            dense_docs,
+            dense_meta,
+            lexical_docs,
+            lexical_meta,
+            k_select,
+            rerank_enabled,
+        )
 
     def _run_dense_retrieval(self, query: str, k: int) -> Tuple[List, List]:
         fetch_k = min(self.MMR_FETCH_K_MAX, max(self.MMR_FETCH_K_MIN, k * 3))
@@ -220,11 +257,13 @@ class AdaptiveRetriever:
 
     def _merge_hybrid(
         self,
+        query: str,
         dense_docs: List,
         dense_meta: List,
         lexical_docs: List,
         lexical_meta: List,
         k_select: int,
+        rerank_enabled: bool,
     ) -> Tuple[List, List]:
         merged = {}
 
@@ -253,7 +292,8 @@ class AdaptiveRetriever:
             scored.append((combined, payload["doc"], m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
-        top = scored[:k_select]
+        reranked = self._cross_encoder_rerank(query, scored) if rerank_enabled else scored
+        top = reranked[:k_select]
         out_docs = []
         out_meta = []
         for idx, (_score, doc, meta) in enumerate(top):
@@ -262,6 +302,49 @@ class AdaptiveRetriever:
             out_docs.append(doc)
             out_meta.append(m)
         return out_docs, out_meta
+
+    def _cross_encoder_rerank(self, query: str, scored: List[Tuple[float, object, dict]]) -> List[Tuple[float, object, dict]]:
+        if not self.USE_CROSS_ENCODER_RERANK or not scored:
+            return scored
+        model = self._get_cross_encoder()
+        if model is None:
+            return scored
+        try:
+            top_n = max(1, min(self.CROSS_ENCODER_CANDIDATES, len(scored)))
+            head = scored[:top_n]
+            tail = scored[top_n:]
+            pairs = [(query, self._doc_text(doc)) for _, doc, _ in head]
+            t0 = time.perf_counter()
+            ce_scores = model.predict(pairs)
+            rerank_ms = (time.perf_counter() - t0) * 1000.0
+            ce_head = []
+            for (base_score, doc, meta), ce_score in zip(head, ce_scores):
+                m = dict(meta)
+                m["cross_encoder_score"] = round(float(ce_score), 4)
+                m["rerank_latency_ms"] = round(rerank_ms, 2)
+                m["retrieval_mode"] = (
+                    (m.get("retrieval_mode", "") + "+cross_encoder").strip("+")
+                )
+                ce_head.append((float(ce_score), doc, m))
+            ce_head.sort(key=lambda x: x[0], reverse=True)
+            # Keep tail in baseline order so reranking stays bounded.
+            return ce_head + tail
+        except Exception as exc:
+            print(f"[AdaptiveRetriever] Cross-encoder rerank skipped: {type(exc).__name__}: {exc}")
+            return scored
+
+    def _get_cross_encoder(self):
+        if self._cross_encoder_failed:
+            return None
+        if self._cross_encoder is not None:
+            return self._cross_encoder
+        try:
+            self._cross_encoder = CrossEncoder(self.CROSS_ENCODER_MODEL)
+            return self._cross_encoder
+        except Exception as exc:
+            self._cross_encoder_failed = True
+            print(f"[AdaptiveRetriever] Failed to load cross-encoder '{self.CROSS_ENCODER_MODEL}': {type(exc).__name__}: {exc}")
+            return None
 
     def _keyword_coverage_score(self, query: str, docs: List) -> float:
         keywords = self._extract_keywords(query)
