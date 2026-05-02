@@ -38,6 +38,7 @@ class SemanticCache:
             return None
 
     def lookup(self, query: str, corpus_hash: str) -> Optional[Dict[str, Any]]:
+        """Return a cached result when a near-duplicate query match is strong enough."""
         query_emb = self._embed_query(query)
         if query_emb is None:
             return None
@@ -59,6 +60,7 @@ class SemanticCache:
         return cached_result
 
     def store(self, query: str, result: Dict[str, Any], corpus_hash: str) -> None:
+        """Store high-confidence, non-retried results for future semantic cache hits."""
         if not isinstance(result, dict):
             LOG.debug("[SemanticCache] store skipped: result is not a dict")
             return
@@ -101,6 +103,7 @@ class SemanticCache:
 
     @staticmethod
     def get_corpus_hash(chroma_dir: str) -> str:
+        """Compute a lightweight hash of Chroma file mtimes for cache invalidation."""
         if not chroma_dir or not os.path.isdir(chroma_dir):
             return ""
         items: List[str] = []

@@ -112,6 +112,7 @@ class AdaptiveRetriever:
         analyzer_confidence: float = None,
         force_k: int = None,
     ) -> dict:
+        """Run hybrid retrieval with adaptive k, optional retry, and rerank metadata."""
         normalized_complexity = (complexity or "medium").strip().lower()
         fallback_score_map = {"simple": 0.2, "medium": 0.55, "complex": 0.85}
         score = complexity_score if complexity_score is not None else fallback_score_map.get(normalized_complexity, 0.55)
@@ -407,6 +408,7 @@ class AdaptiveRetriever:
         self._factual_matrix = self._factual_vectorizer.fit_transform(texts)
 
     def retrieve_factual_sentences(self, query: str, top_n: int = 20) -> List[dict]:
+        """Return top factual sentence candidates scored by TF-IDF + token overlap."""
         if (
             not self._factual_sentences
             or self._factual_vectorizer is None

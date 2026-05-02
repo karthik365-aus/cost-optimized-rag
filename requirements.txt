@@ -14,4 +14,6 @@ transformers
 fastapi
 uvicorn
 pypdf
+pymupdf
+google-generativeai
 streamlit

@@ -706,3 +706,240 @@ _Appended; all sections above remain as-is._
 ### Quick verification
 - `src/pipeline.py` compiles successfully (`py_compile`).
 - Lint check passed for touched files.
+
+## Updates — May 1, 2026 (embedding reuse in confidence checker + robust retry scope cap)
+
+_Appended; all sections above remain as-is._
+
+### `src/context_compression.py` + `src/confidence_checker.py` (embedding reuse)
+- Added carry-through of selected sentence embeddings from compression output:
+  - `_selected_sentence_embeddings` is now included in compression results when embedding scoring is active.
+- Extended confidence-check embedding API to accept precomputed context sentence embeddings:
+  - `embedding_similarity(..., context_sentences, context_sentence_embeddings)`
+  - `check_confidence(..., context_sentences, context_sentence_embeddings)`
+- Behavior:
+  - confidence checker reuses compressor-provided sentence embeddings and encodes only the answer embedding for similarity,
+  - fallback path still works if cached embeddings are unavailable/mismatched.
+
+### `src/pipeline.py` (wire embedding reuse through all confidence paths)
+- Updated confidence-check calls to pass selected sentences + carried embeddings for:
+  - initial confidence scoring,
+  - robust retry confidence scoring,
+  - grounding-triggered OpenAI fallback confidence scoring.
+
+### `src/pipeline.py` (cap robust retry to non-simple queries)
+- Restricted typo-tolerant robust retry to medium/complex requests only:
+  - added `complexity != "simple"` condition to `should_retry_robust`.
+- Goal:
+  - avoid extra retrieval/compression/router passes on simple low-coverage questions where refusal/grounding guard is usually preferable.
+
+### Quick verification
+- Lint check passed for:
+  - `src/context_compression.py`
+  - `src/confidence_checker.py`
+  - `src/pipeline.py`
+- Compile checks passed for the same files (`py_compile`).
+
+## Updates — May 1, 2026 (session-only multimodal PDF retrieval + UI upload/title enhancements)
+
+_Appended; all sections above remain as-is._
+
+### `src/session_multimodal_retriever.py` (new module, in-memory only)
+- Added session-only multimodal retriever for uploaded visual PDFs:
+  - no persistence,
+  - no ChromaDB writes,
+  - no changes to main corpus index.
+- Implemented chunking spec:
+  - primary sentence split: `re.split(r"(?<=[.!?])\\s+", page_text)`,
+  - fallback paragraph split (`\\n\\n`) when primary yields fewer than 2 usable chunks,
+  - post-filter: trim, drop `<30` chars, hard-cap to `700` chars.
+- Added `SessionMultimodalError` for explicit failure signaling.
+- Added `detect_visual_pdf(pdf_bytes)` using `fitz` image detection (`page.get_images()`).
+- Gemini embedding integration:
+  - model: `models/gemini-embedding-2-preview`,
+  - `output_dimensionality=768`,
+  - `task_type="retrieval_document"` for chunks,
+  - `task_type="retrieval_query"` for query.
+- Retrieval behavior:
+  - cosine similarity,
+  - fixed `top_k=3`,
+  - returns `text`, `page_num`, `score`.
+
+### `src/pipeline.py` (conditional session multimodal routing)
+- Extended `run(...)` signature with optional `session_uploads` metadata while preserving existing `session_documents` behavior.
+- Added multimodal activation gate (all must pass):
+  - session uploads present,
+  - `USE_SESSION_MULTIMODAL_EMBEDDING=true`,
+  - `GEMINI_API_KEY` set,
+  - uploaded PDF contains images.
+- On activation success:
+  - builds session multimodal index,
+  - retrieves top multimodal chunks and appends texts to context before compression.
+- On failure (`SessionMultimodalError`):
+  - logs warning and falls back to text-only session path.
+- Added observability fields:
+  - `multimodal_embedding_used`,
+  - `multimodal_embedding_reason`,
+  - `multimodal_hits_count`.
+
+### `ui.py` (upload metadata path + dynamic title)
+- Upgraded upload extraction to produce structured session payload:
+  - filename/mime,
+  - raw PDF bytes,
+  - per-page text map (`pdf_text_by_page`),
+  - combined extracted text.
+- Pipeline calls now pass both:
+  - `session_documents` (text path),
+  - `session_uploads` (metadata path for multimodal detection/retrieval).
+- Header title now updates from uploaded document name (stem) for session context visibility; defaults back to `Notre Dame Assistant` when no file is loaded.
+
+### Config and dependencies
+- `.env.example` additions:
+  - `GEMINI_API_KEY=`
+  - `USE_SESSION_MULTIMODAL_EMBEDDING=false`
+  - comments clarifying optional feature behavior and fallback.
+- `requirements.txt` additions:
+  - `google-generativeai`
+  - `pymupdf`
+
+### Runtime checks performed
+- Lint checks passed for touched files.
+- Compile checks passed for:
+  - `src/session_multimodal_retriever.py`
+  - `src/pipeline.py`
+  - `ui.py`
+- Streamlit restarted successfully and verified reachable at `http://localhost:8501`.
+
+## Updates — May 1, 2026 (session multimodal index cache + reuse)
+
+_Appended; all sections above remain as-is._
+
+### `src/session_multimodal_retriever.py` (session-scoped in-memory Chroma cache)
+- Upgraded from per-query in-memory list scoring to a session-scoped in-memory Chroma collection:
+  - session key: `md5(pdf_bytes)[:12]`,
+  - collection name: `session_<session_id>`,
+  - single shared in-memory Chroma client per process.
+- Added `GeminiEmbeddingFunction` wrapper for Chroma-compatible embeddings:
+  - Gemini model: `models/gemini-embedding-2-preview`,
+  - `output_dimensionality=768`,
+  - query path still uses `task_type="retrieval_query"`.
+- `build_index()` now caches embeddings in collection:
+  - if collection already has documents, it skips re-embedding (cache hit),
+  - otherwise it chunks, embeds once, and stores ids/documents/embeddings/metadata.
+- `retrieve()` now queries Chroma directly with `query_embeddings=[...]` and returns top-3 hits.
+- Added retriever stats used for observability:
+  - `chunk_count`,
+  - `avg_chunk_tokens`,
+  - `last_build_reused_cache`.
+
+### `src/pipeline.py` (retriever reuse across follow-up queries)
+- Added pipeline-level retriever cache:
+  - `self._session_multimodal_retrievers: dict[str, SessionMultimodalRetriever]`.
+- For visual uploads:
+  - computes `session_id`,
+  - reuses existing retriever instance when same PDF is queried again,
+  - falls back to create/build only on first encounter.
+- Added cache-hit logging:
+  - `[SessionMultimodal] reusing index for session_<id>, skipping <n> chunk embeddings`.
+
+### New observability fields (result + retrieval diagnostics)
+- Added:
+  - `session_index_rebuilt` (True on first build, False on cache hit),
+  - `session_index_chunk_count`,
+  - `session_embedding_tokens_saved` (estimated via `chunk_count * avg_chunk_tokens` on cache hit).
+- Existing multimodal fields remain unchanged:
+  - `multimodal_embedding_used`,
+  - `multimodal_embedding_reason`,
+  - `multimodal_hits_count`.
+
+### Quick verification
+- Compile checks passed:
+  - `src/session_multimodal_retriever.py`
+  - `src/pipeline.py`
+- Lint checks passed for both touched files.
+
+## Updates — May 1, 2026 (session retrieval mode toggle + upload-session fast path + generic UI cleanup)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` (session retrieval policy controls + latency improvements)
+- Added `session_retrieval_mode` to `RAGPipeline.run(...)`:
+  - supported values: `upload_only`, `hybrid`,
+  - default fallback from env (`SESSION_RETRIEVAL_MODE`) or `hybrid`.
+- Retrieval behavior now mode-aware:
+  - `upload_only`: skips corpus retrieval (`k=0`) and uses uploaded/session context only,
+  - `hybrid`: uses corpus retrieval + session context merge.
+- Added session upload-only extractive fast path:
+  - for factual-style prompts (e.g., short `what is ...`),
+  - extracts answer from session sentences directly before router generation.
+- Added session-scoped exact-match query cache:
+  - key: `(session_scope_hash, normalized_query)`,
+  - `session_scope_hash` derives from uploaded file bytes/text + retrieval mode,
+  - prevents cross-file contamination while enabling repeat-query speedups in the same upload session.
+- Added observability fields:
+  - `session_retrieval_mode`,
+  - `session_corpus_supplement_used`,
+  - `session_corpus_supplement_count`,
+  - plus cache visibility via result-level `cache_hit` / `cache_similarity`.
+
+### `ui.py` (mode toggle + cache visibility + generic assistant copy)
+- Added visible session retrieval mode toggle in chat UI when files are uploaded:
+  - `Upload only (ignore base corpus)`,
+  - `Hybrid (uploaded files + base corpus)`.
+- Passed `session_retrieval_mode` into `pipeline.run(...)`.
+- Added visible `cache hit` pill in chat metadata strip:
+  - shows `cache hit` and, when available, similarity score.
+- Generalized assistant branding and messaging:
+  - replaced Notre-Dame-specific title/subtitle and prompts with generic assistant language,
+  - updated uploader label to `Upload file (PDF/TXT)`,
+  - generalized fallback/off-topic messaging to context-based wording.
+- Updated visual styling:
+  - switched to generic robot icon (`🤖`),
+  - increased icon size and applied high-contrast, bold header color for better visibility.
+
+### Runtime behavior changes observed
+- Repeated identical queries in the same upload session now short-circuit on session cache.
+- Simple definition-style questions in `upload_only` mode can avoid local LLM generation via extractive answer.
+- Previous startup `403` symptoms traced to proxy/HF metadata requests; runtime stabilized by launching with:
+  - `HF_HUB_OFFLINE=1`,
+  - `TRANSFORMERS_OFFLINE=1`,
+  - and (for responsiveness during tests) `USE_SESSION_MULTIMODAL_EMBEDDING=false`.
+
+### Quick verification
+- Compile checks passed:
+  - `src/pipeline.py`
+  - `ui.py`
+- Lint checks passed for touched files.
+- Streamlit restarted successfully and reachable at `http://localhost:8501`.
+
+## Updates — May 1, 2026 (upload-session answer isolation + grounding allowlist + text-only session embeddings)
+
+_Appended; all sections above remain as-is._
+
+### `ui.py` (prevent answer bleed in upload sessions)
+- Updated short-query contextual stitching behavior:
+  - when `session_uploads` is present, skip `build_contextual_query(...)` stitching entirely,
+  - each uploaded-file query is treated independently to prevent prior-turn topic contamination.
+- Existing stitching behavior remains unchanged when no uploads are present.
+
+### `src/pipeline.py` (grounding false-positive reduction for technical terms)
+- Added a technical entity allowlist used by `_grounding_gate(...)` filtering before unsupported-entity checks:
+  - `BM25`, `TF-IDF`, `BERT`, `embeddings`, `cosine`, `LangChain`, `LlamaIndex`, `ChromaDB`, `RAG`, `LLM`, `API`.
+- Result: standard technical acronyms from uploaded docs no longer trigger avoidable `unsupported_entities` failures.
+
+### `src/session_multimodal_retriever.py` + `src/pipeline.py` (all-upload activation with Gemini/BGE routing)
+- Added `use_gemini: bool` to `SessionMultimodalRetriever`:
+  - `use_gemini=True`: Gemini embeddings path (`session_<session_id>` collection),
+  - `use_gemini=False`: local BGE path via `get_embedding_model("BAAI/bge-small-en-v1.5")` (`session_text_<session_id>` collection), zero Gemini API cost.
+- Pipeline session retrieval activation now runs for all uploads (not only visual+key):
+  - visual PDF + Gemini key → `use_gemini=True`,
+  - text-only upload (or visual upload without key) → `use_gemini=False`.
+- Kept manual query embedding behavior (`query_embeddings`) unchanged.
+- Removed pipeline-level session retriever object cache usage so in-memory session collection reuse is owned by the retriever module cache.
+
+### Quick verification
+- Compile checks passed:
+  - `src/session_multimodal_retriever.py`
+  - `src/pipeline.py`
+  - `ui.py`
+- Lint checks passed for touched files.

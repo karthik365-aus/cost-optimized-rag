@@ -80,6 +80,7 @@ class QueryAnalyzer:
         self._llm_pipeline = None
 
     def analyze(self, query: str) -> Dict[str, Any]:
+        """Classify a query and return complexity label, score, confidence, and reason codes."""
         normalized = (query or "").lower().strip()
         word_count = len(normalized.split())
         baseline = self._baseline_decision(normalized, word_count)

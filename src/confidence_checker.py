@@ -89,6 +89,7 @@ def _select_confidence_threshold(model_used: str, router_output: Dict[str, Any])
 # HEURISTIC SCORING
 # -----------------------------
 def heuristic_score(answer: str, context: str, complexity: str = "medium") -> float:
+    """Cheap quality signal from answer length/shape and lexical grounding overlap."""
     if not answer or len(answer.strip()) == 0:
         return 0.0
 
@@ -119,6 +120,7 @@ def heuristic_score(answer: str, context: str, complexity: str = "medium") -> fl
 # TF-IDF SIMILARITY
 # -----------------------------
 def tfidf_similarity(answer: str, context: str) -> float:
+    """Return TF-IDF cosine similarity between answer text and compressed context."""
     if not answer.strip() or not context.strip():
         return 0.0
     try:
@@ -133,26 +135,50 @@ def tfidf_similarity(answer: str, context: str) -> float:
 # -----------------------------
 # EMBEDDING SIMILARITY
 # -----------------------------
-def embedding_similarity(answer: str, context: str) -> float:
+def embedding_similarity(
+    answer: str,
+    context: str,
+    context_sentences=None,
+    context_sentence_embeddings=None,
+) -> float:
+    """Return max-pooled sentence-level embedding similarity for grounding strength."""
     if not answer.strip() or not context.strip():
         return 0.0
     model = _get_embedding_model()
     if model is None:
         return 0.0
     try:
-        sentences = [
-            s.strip()
-            for s in re.split(r"(?<=[.!?])\s+", context)
-            if len(s.strip()) > 15
-        ]
+        sentences = []
+        if context_sentences:
+            sentences = [s.strip() for s in context_sentences if isinstance(s, str) and s.strip()]
+        if not sentences:
+            sentences = [
+                s.strip()
+                for s in re.split(r"(?<=[.!?])\s+", context)
+                if len(s.strip()) > 15
+            ]
         if not sentences:
             sentences = [context.strip()]
 
-        all_texts = [answer.strip()] + sentences
-        embs = model.encode(all_texts, convert_to_numpy=True)
-        embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
-        answer_emb = embs[0:1]
-        context_embs = embs[1:]
+        context_embs = None
+        if context_sentence_embeddings is not None:
+            try:
+                context_embs = np.asarray(context_sentence_embeddings, dtype=float)
+                if context_embs.ndim == 1:
+                    context_embs = context_embs.reshape(1, -1)
+            except Exception:
+                context_embs = None
+
+        if context_embs is not None and context_embs.size > 0 and context_embs.shape[0] == len(sentences):
+            answer_emb = model.encode([answer.strip()], convert_to_numpy=True)
+            answer_emb = answer_emb / (np.linalg.norm(answer_emb, axis=1, keepdims=True) + 1e-9)
+            context_embs = context_embs / (np.linalg.norm(context_embs, axis=1, keepdims=True) + 1e-9)
+        else:
+            all_texts = [answer.strip()] + sentences
+            embs = model.encode(all_texts, convert_to_numpy=True)
+            embs = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+            answer_emb = embs[0:1]
+            context_embs = embs[1:]
 
         sims = cosine_similarity(answer_emb, context_embs).flatten()
         if sims.size == 0:
@@ -171,6 +197,7 @@ def retry_with_stronger_model(
     stronger_model: str,
     temperature: float = 0.0
 ) -> str:
+    """Ask a stronger model once using the same compressed context."""
     llm = ChatOpenAI(model=stronger_model, temperature=temperature)
     messages = [
         SystemMessage(
@@ -203,6 +230,9 @@ def check_confidence(
     compressed_context: str,
     router_output: Dict[str, Any],
     analyzer_output: Dict[str, Any] = None,
+    context_sentences=None,
+    context_sentence_embeddings=None,
+    allow_retry: bool = True,
 ) -> Dict[str, Any]:
     """Return final answer (possibly retried), confidence scores, and metadata for logging."""
 
@@ -221,7 +251,12 @@ def check_confidence(
     tfidf = tfidf_similarity(answer, compressed_context)
 
     # Step 3 — Embedding similarity score
-    embed = embedding_similarity(answer, compressed_context)
+    embed = embedding_similarity(
+        answer,
+        compressed_context,
+        context_sentences=context_sentences,
+        context_sentence_embeddings=context_sentence_embeddings,
+    )
 
     # Combine weighted average: 50% TF-IDF + 50% embedding
     semantic_score = 0.5 * tfidf + 0.5 * embed
@@ -237,7 +272,7 @@ def check_confidence(
     model_tiers = _build_model_tiers()
 
     # Step 4 — retry if low confidence
-    if confidence_score_final < confidence_threshold and model_used_original in model_tiers:
+    if allow_retry and confidence_score_final < confidence_threshold and model_used_original in model_tiers:
         retried = True
         low_scores = []
         if heuristic < confidence_threshold:
@@ -261,7 +296,12 @@ def check_confidence(
             # recompute scores
             heuristic_new = heuristic_score(new_answer, compressed_context, complexity)
             tfidf_new = tfidf_similarity(new_answer, compressed_context)
-            embed_new = embedding_similarity(new_answer, compressed_context)
+            embed_new = embedding_similarity(
+                new_answer,
+                compressed_context,
+                context_sentences=context_sentences,
+                context_sentence_embeddings=context_sentence_embeddings,
+            )
             semantic_new = 0.5 * tfidf_new + 0.5 * embed_new
             final_new = round(0.7 * semantic_new + 0.3 * heuristic_new, 2)
 

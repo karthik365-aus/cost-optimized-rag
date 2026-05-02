@@ -78,6 +78,7 @@ class ContextCompressor:
         complexity_score: Optional[float] = None,
         coverage_score: Optional[float] = None,
     ) -> Dict[str, Any]:
+        """Compress retrieved docs into a compact, scored context for generation."""
         texts = self._extract_texts(retrieved_docs)
         original_text = "\n\n".join(texts).strip()
         normalized_complexity = (complexity or "medium").strip().lower()
@@ -139,6 +140,12 @@ class ContextCompressor:
             budget=budget,
         )
         selected_sentences = [sentences[i] for i in selected_idx]
+        selected_sentence_embeddings = None
+        if used_embeddings and emb_matrix is not None and selected_idx:
+            try:
+                selected_sentence_embeddings = emb_matrix[selected_idx]
+            except Exception:
+                selected_sentence_embeddings = None
         ranked_for_metadata = list(
             zip(
                 sentences,
@@ -171,6 +178,7 @@ class ContextCompressor:
         return {
             "compressed_context": compressed_context,
             "selected_sentences": selected_sentences,
+            "_selected_sentence_embeddings": selected_sentence_embeddings,
             "all_sentences": sentences,
             "sentence_scores": sentence_scores,
             "selected_indices": selected_idx,
@@ -197,6 +205,7 @@ class ContextCompressor:
         return {
             "compressed_context": "",
             "selected_sentences": [],
+            "_selected_sentence_embeddings": None,
             "all_sentences": [],
             "sentence_scores": [],
             "selected_indices": [],

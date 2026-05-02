@@ -11,13 +11,15 @@ Fixes applied v2:
   - Pricing dashboard: actual vs baseline cost, $ saved, % reduction
 """
 
+import io
+from pathlib import Path
 import re
 import time
 import streamlit as st
 
 # ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Notre Dame Assistant",
+    page_title="AI Assistant",
     page_icon="🏛️",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -37,11 +39,13 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
     margin-bottom: 20px;
 }
 .nd-logo {
-    width: 42px; height: 42px; background: #0C2340;
+    width: 54px; height: 54px; background: #2563EB;
     border-radius: 10px; display: flex; align-items: center;
-    justify-content: center; font-size: 20px; flex-shrink: 0;
+    justify-content: center; font-size: 30px; flex-shrink: 0;
+    color: #FFFFFF;
+    box-shadow: 0 2px 8px rgba(37, 99, 235, 0.35);
 }
-.nd-title { font-size: 20px; font-weight: 600; color: #0C2340; margin: 0; }
+.nd-title { font-size: 24px; font-weight: 800; color: #1D4ED8; margin: 0; }
 .nd-sub   { font-size: 12px; color: #666; margin: 2px 0 0; }
 
 .chat-wrap { display: flex; flex-direction: column; gap: 16px; padding: 8px 0; }
@@ -81,6 +85,7 @@ html, body, [class*="css"] { font-family: 'DM Sans', sans-serif; }
 .dot-simple  { background: #3B6D11; }
 .dot-medium  { background: #BA7517; }
 .dot-complex { background: #A32D2D; }
+.dot-cache   { background: #15803D; }
 
 /* ── Dashboard stat cards ── */
 .stat-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 10px; margin-bottom: 20px; }
@@ -196,6 +201,8 @@ for key, default in [
     ("query_log", []),
     ("pipeline", None),
     ("pipeline_error", None),
+    ("active_session_title", "AI Assistant"),
+    ("session_retrieval_mode", "upload_only"),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -209,6 +216,79 @@ def load_pipeline():
         return RAGPipeline(), None
     except Exception as e:
         return None, str(e)
+
+
+def _extract_session_upload(uploaded_file):
+    """Best-effort extraction + metadata for session uploads (PDF/TXT)."""
+    name = (uploaded_file.name or "").lower()
+    data = uploaded_file.getvalue()
+    payload = {
+        "name": uploaded_file.name or "",
+        "mime_type": getattr(uploaded_file, "type", "") or "",
+        "bytes": None,
+        "pdf_text_by_page": {},
+        "text": "",
+    }
+    if not data:
+        return payload
+    if name.endswith(".txt"):
+        try:
+            payload["text"] = data.decode("utf-8", errors="ignore").strip()
+            return payload
+        except Exception:
+            return payload
+    if name.endswith(".pdf"):
+        payload["bytes"] = data
+        try:
+            import fitz
+
+            doc = fitz.open(stream=data, filetype="pdf")
+            pages = []
+            text_by_page = {}
+            try:
+                for page_num, page in enumerate(doc):
+                    text = (page.get_text("text", sort=True) or "").strip()
+                    if text:
+                        pages.append(text)
+                        text_by_page[page_num] = text
+            finally:
+                doc.close()
+            payload["pdf_text_by_page"] = text_by_page
+            payload["text"] = "\n\n".join(pages).strip()
+        except Exception:
+            try:
+                from pypdf import PdfReader
+
+                reader = PdfReader(io.BytesIO(data))
+                pages = []
+                text_by_page = {}
+                for page_num, page in enumerate(reader.pages):
+                    text = (page.extract_text() or "").strip()
+                    if text:
+                        pages.append(text)
+                        text_by_page[page_num] = text
+                payload["pdf_text_by_page"] = text_by_page
+                payload["text"] = "\n\n".join(pages).strip()
+            except Exception:
+                return payload
+        return payload
+    return payload
+
+
+def _render_header(title: str):
+    safe_title = (title or "AI Assistant").strip()
+    st.markdown(
+        f"""
+<div class="nd-header">
+  <div class="nd-logo">🤖</div>
+  <div>
+    <div class="nd-title">{safe_title}</div>
+    <div class="nd-sub">Cost-Optimized RAG Assistant</div>
+  </div>
+</div>
+""",
+        unsafe_allow_html=True,
+    )
 
 
 # ── Off-topic guard ───────────────────────────────────────────────────────────
@@ -284,6 +364,8 @@ def meta_strip_html(meta: dict) -> str:
     lat    = f"{int(ms)}ms" if ms < 1000 else f"{ms/1000:.1f}s"
     cost_s = "free (local)" if cost == 0 else fmt_cost(cost)
     comp_mode = (diag.get("compression_mode") or "standard").replace("_", " ")
+    cache_hit = bool(meta.get("cache_hit", False))
+    cache_similarity = meta.get("cache_similarity", None)
     pills  = [
         pill(f"dot-{c}", c),
         pill("", model),
@@ -294,6 +376,11 @@ def meta_strip_html(meta: dict) -> str:
         pill("", f"mode: {comp_mode}"),
         pill("", cost_s),
     ]
+    if cache_hit:
+        if isinstance(cache_similarity, (int, float)):
+            pills.append(pill("dot-cache", f"cache hit ({float(cache_similarity):.2f})"))
+        else:
+            pills.append(pill("dot-cache", "cache hit"))
     return f'<div class="meta-strip">{"".join(pills)}</div>'
 
 
@@ -534,15 +621,9 @@ def render_dashboard():
 
 
 # ── App layout ────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="nd-header">
-  <div class="nd-logo">🏛️</div>
-  <div>
-    <div class="nd-title">Notre Dame Assistant</div>
-    <div class="nd-sub">University of Notre Dame · Cost-Optimized RAG · GPU2_Group1 · BSAN 765</div>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+header_placeholder = st.empty()
+with header_placeholder.container():
+    _render_header(st.session_state.get("active_session_title", "AI Assistant"))
 
 chat_tab, dash_tab = st.tabs(["💬  Chat", "📊  Dashboard"])
 
@@ -550,8 +631,8 @@ chat_tab, dash_tab = st.tabs(["💬  Chat", "📊  Dashboard"])
 # ── CHAT TAB ──────────────────────────────────────────────────────────────────
 with chat_tab:
 
-    # Load pipeline once
-    if st.session_state.pipeline is None and st.session_state.pipeline_error is None:
+    # Load pipeline whenever unavailable (prevents stale "stuck" startup errors).
+    if st.session_state.pipeline is None:
         with st.spinner("Loading pipeline and vector database…"):
             pipeline, err = load_pipeline()
             st.session_state.pipeline = pipeline
@@ -560,20 +641,58 @@ with chat_tab:
     if st.session_state.pipeline_error:
         st.error(f"Pipeline failed to load: {st.session_state.pipeline_error}")
         st.info("Check that LM Studio is running and your .env is configured.")
+        if st.button("Retry pipeline load"):
+            load_pipeline.clear()
+            st.session_state.pipeline = None
+            st.session_state.pipeline_error = None
+            st.rerun()
         st.stop()
+
+    uploaded_files = st.file_uploader(
+        "Upload file (PDF/TXT)",
+        type=["pdf", "txt"],
+        accept_multiple_files=True,
+        help="Uploaded files are used as session context and are not permanently indexed.",
+    )
+    session_documents = []
+    session_uploads = []
+    if uploaded_files:
+        skipped_files = 0
+        for f in uploaded_files:
+            payload = _extract_session_upload(f)
+            extracted = payload.get("text", "")
+            session_uploads.append(payload)
+            if len(extracted) >= 80:
+                session_documents.append(extracted)
+            else:
+                skipped_files += 1
+        first_name = Path(uploaded_files[0].name or "").stem if uploaded_files else ""
+        st.session_state.active_session_title = first_name or "AI Assistant"
+        st.caption(
+            f"Session docs loaded: {len(session_documents)} file(s)"
+            + (f" · skipped {skipped_files} file(s) with too little extractable text" if skipped_files else "")
+        )
+        st.radio(
+            "Session retrieval mode",
+            options=["upload_only", "hybrid"],
+            format_func=lambda x: "Upload only (ignore base corpus)" if x == "upload_only" else "Hybrid (uploaded files + base corpus)",
+            horizontal=True,
+            key="session_retrieval_mode",
+            help="Choose whether uploaded files replace corpus retrieval or augment it.",
+        )
+    else:
+        st.session_state.active_session_title = "AI Assistant"
+
+    with header_placeholder.container():
+        _render_header(st.session_state.active_session_title)
 
     # Render history
     if not st.session_state.messages:
         st.markdown("""
         <div style="text-align:center;padding:40px 0;color:#aaa">
-          <div style="font-size:36px;margin-bottom:10px">🏛️</div>
+          <div style="font-size:36px;margin-bottom:10px">🤖</div>
           <div style="font-size:15px;font-weight:500;color:#666;margin-bottom:8px">
-            Ask anything about the University of Notre Dame
-          </div>
-          <div style="font-size:13px;color:#aaa;line-height:1.8">
-            Try: "What is the Hesburgh Library?" &nbsp;·&nbsp;
-            "Who founded Notre Dame?" &nbsp;·&nbsp;
-            "Compare Notre Dame to peer universities"
+            Hi there! Ask me anything and I will try to help.
           </div>
         </div>
         """, unsafe_allow_html=True)
@@ -611,7 +730,7 @@ with chat_tab:
         with col_in:
             user_input = st.text_input(
                 "query",
-                placeholder="Ask about the University of Notre Dame…",
+                placeholder="Ask a question or upload a file for context…",
                 label_visibility="collapsed",
             )
         with col_btn:
@@ -626,21 +745,31 @@ with chat_tab:
             st.session_state.messages.append({
                 "role": "bot",
                 "text": (
-                    "I can only answer questions about the University of Notre Dame. "
-                    "Try asking about its history, academics, campus, traditions, or notable people."
+                    "I can only answer based on the available context and uploaded files. "
+                    "Try rephrasing your question or upload a relevant document."
                 ),
                 "off_topic": True,
             })
             st.rerun()
 
-        # Build contextual query for short follow-ups
-        prior = st.session_state.messages[:-1]  # exclude the one just appended
-        contextual_query = build_contextual_query(query, prior, n_prior=2)
+        # Build contextual query for short follow-ups only when no uploads are active.
+        # Uploaded documents already provide the working context; stitching prior turns
+        # can contaminate answers across unrelated questions.
+        if session_uploads:
+            contextual_query = query
+        else:
+            prior = st.session_state.messages[:-1]  # exclude the one just appended
+            contextual_query = build_contextual_query(query, prior, n_prior=2)
 
         # Run pipeline
         with st.spinner("Retrieving and generating answer…"):
             t0     = time.perf_counter()
-            result = st.session_state.pipeline.run(contextual_query)
+            result = st.session_state.pipeline.run(
+                contextual_query,
+                session_documents=session_documents if session_documents else None,
+                session_uploads=session_uploads if session_uploads else None,
+                session_retrieval_mode=st.session_state.get("session_retrieval_mode", "upload_only"),
+            )
             ui_ms  = round((time.perf_counter() - t0) * 1000, 1)
 
         # Layer 2 — low coverage + low confidence
@@ -648,8 +777,8 @@ with chat_tab:
             st.session_state.messages.append({
                 "role": "bot",
                 "text": (
-                    "I couldn't find relevant information about that in the Notre Dame corpus. "
-                    "Please ask a question related to the university."
+                    "I couldn't find relevant information in the current context. "
+                    "Please rephrase the question or upload a document with the needed details."
                 ),
                 "off_topic": True,
             })
@@ -672,6 +801,8 @@ with chat_tab:
             "compression_tokens_saved": result.get("compression_tokens_saved", 0),
             "k_final":                  result.get("k_final", result.get("k", "—")),
             "actual_cost":              actual_cost,
+            "cache_hit":                result.get("cache_hit", False),
+            "cache_similarity":         result.get("cache_similarity"),
             "retrieval_diagnostics":    result.get("retrieval_diagnostics", {}),
         }
 

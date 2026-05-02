@@ -24,10 +24,12 @@ class PreflightError(Exception):
 
 
 def project_root_from_here() -> Path:
+    """Resolve repository root from this module location."""
     return Path(__file__).resolve().parents[1]
 
 
 def resolve_under_project(project_root: Path, path: Path | str) -> Path:
+    """Resolve relative/absolute input path under the project root."""
     p = Path(path).expanduser()
     if not p.is_absolute():
         p = (project_root / p).resolve()
@@ -35,6 +37,7 @@ def resolve_under_project(project_root: Path, path: Path | str) -> Path:
 
 
 def chroma_dir(project_root: Path) -> Path:
+    """Return the canonical project Chroma directory path."""
     return project_root / "chroma_db"
 
 
@@ -91,6 +94,7 @@ def _local_models_url(base_url: str) -> str:
 
 
 def fetch_local_model_ids(base_url: str, timeout: float = 3.0) -> Set[str]:
+    """Fetch advertised model ids from an OpenAI-compatible local endpoint."""
     url = _local_models_url(base_url)
     r = requests.get(url, timeout=timeout)
     r.raise_for_status()
@@ -111,6 +115,7 @@ def check_local_openai_models(
     medium_model: str,
     timeout: float,
 ) -> None:
+    """Validate configured local model IDs exist on the local server."""
     if skip:
         logger.info("Skipping local /v1/models preflight (--skip-local-model-check).")
         return
@@ -131,6 +136,7 @@ def check_local_openai_models(
 
 
 def warn_openai_key_if_missing(require: bool) -> None:
+    """Warn or fail when OPENAI_API_KEY is missing based on run requirements."""
     key = (os.getenv("OPENAI_API_KEY") or "").strip()
     if key:
         return
@@ -166,6 +172,7 @@ def log_effective_configuration(
     *,
     emit_print: bool = True,
 ) -> Dict[str, Any]:
+    """Emit a sanitized config snapshot to logs/console and return it."""
     cfg = effective_config_dict(project_root, documents_path)
     lines = [
         "Effective configuration (sanitized):",

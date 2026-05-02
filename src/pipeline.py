@@ -13,6 +13,7 @@ and the final answer (for ``evaluate.py`` and logging).
 """
 from pathlib import Path
 import difflib
+import hashlib
 import os
 import re
 import time
@@ -28,6 +29,11 @@ from src.confidence_checker import check_confidence
 from src.preflight import log_pipeline_startup
 from src.semantic_cache import SemanticCache
 from src.adaptive_retriever import CHROMA_DIR
+from src.session_multimodal_retriever import (
+    SessionMultimodalError,
+    SessionMultimodalRetriever,
+    detect_visual_pdf,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,6 +52,7 @@ class RAGPipeline:
         self.corpus_hash = SemanticCache.get_corpus_hash(CHROMA_DIR)
         self._vocab_index_cache = None
         self._vocab_all_cache = None
+        self._session_query_cache: dict[tuple[str, str], dict] = {}
         log_pipeline_startup(PROJECT_ROOT, documents_path)
 
     SPELLCHECK_EXCLUDE = {
@@ -64,6 +71,13 @@ class RAGPipeline:
     HYDE_MAX_CHARS = int(os.getenv("HYDE_MAX_CHARS", "700"))
     MAX_HEAVY_FALLBACKS = int(os.getenv("PIPELINE_MAX_HEAVY_FALLBACKS", "1"))
     DEEP_OPENAI_MIN_COVERAGE = float(os.getenv("DEEP_OPENAI_MIN_COVERAGE", "0.40"))
+    USE_SESSION_MULTIMODAL_EMBEDDING = (
+        os.getenv("USE_SESSION_MULTIMODAL_EMBEDDING", "false").lower() == "true"
+    )
+    SESSION_UPLOAD_MIN_COMPLEXITY_SCORE = float(
+        os.getenv("SESSION_UPLOAD_MIN_COMPLEXITY_SCORE", "0.60")
+    )
+    SESSION_PRIORITY_HITS = int(os.getenv("SESSION_PRIORITY_HITS", "2"))
     PROTECTED_FACTUAL_PREFIXES = (
         "how many ",
         "who ",
@@ -73,6 +87,19 @@ class RAGPipeline:
         "what is ",
         "what was ",
     )
+    TECHNICAL_ENTITY_ALLOWLIST = {
+        "bm25",
+        "tf-idf",
+        "bert",
+        "embeddings",
+        "cosine",
+        "langchain",
+        "llamaindex",
+        "chromadb",
+        "rag",
+        "llm",
+        "api",
+    }
 
     def _build_vocab_index(self) -> dict[str, set[str]]:
         if self._vocab_index_cache is not None:
@@ -193,7 +220,13 @@ class RAGPipeline:
             return False, {"reason": "empty_answer_or_context", "unsupported_entities": []}
 
         entities = self._extract_answer_entities(ans)
-        unsupported = [e for e in entities if e not in ctx]
+        filtered_entities = []
+        for e in entities:
+            parts = set(re.findall(r"[a-z0-9-]+", e.lower()))
+            if parts & self.TECHNICAL_ENTITY_ALLOWLIST:
+                continue
+            filtered_entities.append(e)
+        unsupported = [e for e in filtered_entities if e not in ctx]
 
         # If answer introduces unseen entities, treat as ungrounded.
         if unsupported:
@@ -206,6 +239,20 @@ class RAGPipeline:
         factual_starts = ("who ", "when ", "where ", "how many", "what is", "what was", "which ")
         analytical_markers = ("compare", "analyze", "explain why", "strategy", "impact of", "trade-off")
         return q.startswith(factual_starts) and not any(m in q for m in analytical_markers)
+
+    @staticmethod
+    def _is_session_extractive_query(query: str) -> bool:
+        """
+        In upload-only sessions, keep extractive path very narrow (numeric/date facts).
+        Conceptual definitions and entity questions should use LLM generation.
+        """
+        q = (query or "").lower().strip()
+        return bool(
+            re.match(
+                r"^(how many\b|what year\b|when\b)",
+                q,
+            )
+        )
 
     @staticmethod
     def _subject_aliases(subject: str) -> set[str]:
@@ -378,12 +425,122 @@ class RAGPipeline:
             for h in sorted(factual_hits, key=lambda x: overlap_score(x["text"]), reverse=True):
                 if re.search(r"\b(18|19|20)\d{2}\b", h["text"]):
                     return h["text"]
+        if re.match(r"^(what is|what was|define)\b", q):
+            subject = re.sub(r"^(what is|what was|define)\s+", "", q).strip(" ?.")
+            subject_tokens = set(re.findall(r"[a-z0-9]+", subject))
+            ranked_defs = []
+            for h in factual_hits:
+                text = (h.get("text") or "").strip()
+                normalized_text = re.sub(r"\s+", " ", text).strip()
+                candidate_spans = []
+                if subject:
+                    subj_pat = re.escape(subject)
+                    clause_patterns = [
+                        rf"\b{subj_pat}\b\s+is\s+(.{{8,260}}?)(?:[.!?]|$)",
+                        rf"\b{subj_pat}\b\s+refers to\s+(.{{8,260}}?)(?:[.!?]|$)",
+                        rf"\b{subj_pat}\b\s+means\s+(.{{8,260}}?)(?:[.!?]|$)",
+                        rf"\b{subj_pat}\b\s+defined as\s+(.{{8,260}}?)(?:[.!?]|$)",
+                    ]
+                    for pat in clause_patterns:
+                        for m in re.finditer(pat, normalized_text, flags=re.I):
+                            head = re.search(r"\b(is|refers to|means|defined as)\b", m.group(0), flags=re.I)
+                            if head:
+                                candidate_spans.append(m.group(0).strip())
+                # Split noisy page-level blocks into candidate definition-like lines/sentences.
+                spans = [
+                    re.sub(r"\s+", " ", s).strip()
+                    for s in re.split(r"[\n\r]+|(?<=[.!?])\s+", text)
+                    if (s or "").strip()
+                ]
+                for span in candidate_spans + spans:
+                    span_l = span.lower()
+                    if len(span.split()) < 6:
+                        continue
+                    if not any(m in span_l for m in (" is ", " are ", " refers to ", " defined as ", " means ")):
+                        continue
+                    if subject_tokens and not (set(re.findall(r"[a-z0-9]+", span_l)) & subject_tokens):
+                        continue
+                    score = (
+                        0.6 * overlap_score(span)
+                        + 0.4 * float(h.get("score", 0.0))
+                        + (0.15 if span_l.startswith(subject) else 0.0)
+                    )
+                    ranked_defs.append((score, span))
+            if ranked_defs:
+                ranked_defs.sort(key=lambda x: x[0], reverse=True)
+                if ranked_defs[0][0] >= 0.35:
+                    best = ranked_defs[0][1]
+                    if not re.search(r"[.!?]$", best):
+                        best = f"{best}."
+                    return best
+            return None
         ranked = sorted(
             factual_hits,
             key=lambda x: (overlap_score(x["text"]), x.get("score", 0.0)),
             reverse=True,
         )
         return ranked[0]["text"] if ranked else None
+
+    @staticmethod
+    def _session_scope_hash(
+        session_uploads: list[dict],
+        session_documents: list[str],
+        retrieval_mode: str,
+    ) -> str:
+        digest = hashlib.md5()
+        digest.update((retrieval_mode or "").encode("utf-8"))
+        for upload in session_uploads or []:
+            name = str(upload.get("name", ""))
+            b = upload.get("bytes")
+            digest.update(name.encode("utf-8", errors="ignore"))
+            if isinstance(b, (bytes, bytearray)):
+                digest.update(hashlib.md5(bytes(b)).digest())
+        if not session_uploads:
+            for doc in session_documents or []:
+                digest.update(hashlib.md5((doc or "")[:3000].encode("utf-8", errors="ignore")).digest())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _retrieve_session_factual_sentences(session_context_docs: list[str], query: str, top_n: int = 20) -> list[dict]:
+        q = (query or "").lower().strip()
+        is_definition_query = bool(re.match(r"^(what is|what was|define)\b", q))
+        q_tokens = set(re.findall(r"[a-z0-9]+", (query or "").lower()))
+        stop = {
+            "the", "a", "an", "is", "are", "was", "were", "of", "for", "to", "in",
+            "on", "at", "and", "or", "do", "does", "did", "how", "what", "who",
+            "when", "where", "which", "many",
+        }
+        q_tokens = {t for t in q_tokens if t not in stop}
+        candidates: list[dict] = []
+        for doc_idx, doc in enumerate(session_context_docs or []):
+            for sent in re.split(r"(?<=[.!?])\s+", doc or ""):
+                text = (sent or "").strip()
+                if len(text) < 20:
+                    continue
+                s_tokens = set(re.findall(r"[a-z0-9]+", text.lower()))
+                overlap = len(q_tokens & s_tokens) / max(1, len(q_tokens))
+                if overlap <= 0:
+                    continue
+                score = float(overlap)
+                if is_definition_query:
+                    text_l = text.lower()
+                    definition_markers = (" is ", " are ", " refers to ", " defined as ", " means ")
+                    if any(m in text_l for m in definition_markers):
+                        score += 0.25
+                    # Penalize heading-like fragments for definition prompts.
+                    if len(text.split()) < 7:
+                        score -= 0.2
+                    if not re.search(r"[.!?]$", text):
+                        score -= 0.1
+                candidates.append(
+                    {
+                        "text": text,
+                        "source": f"session_upload_{doc_idx + 1}",
+                        "score": round(score, 4),
+                    }
+                )
+        candidates.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+        return candidates[: max(1, int(top_n))]
 
     @staticmethod
     def _build_uncompressed_context(docs, max_chars: int = 20000) -> str:
@@ -405,7 +562,49 @@ class RAGPipeline:
             total += len(chunk)
         return "\n\n".join(parts).strip()
 
-    def run(self, query: str, session_documents: list[str] | None = None) -> dict:
+    @staticmethod
+    def _inject_session_priority_context(compression: dict, priority_texts: list[str], limit: int = 2) -> dict:
+        if not compression or not priority_texts:
+            return compression
+        compressed = (compression.get("compressed_context") or "").strip()
+        if not compressed:
+            return compression
+
+        additions = []
+        compressed_l = compressed.lower()
+        for txt in priority_texts:
+            snippet = (txt or "").strip()
+            if not snippet:
+                continue
+            if snippet.lower() in compressed_l:
+                continue
+            additions.append(snippet)
+            if len(additions) >= max(1, int(limit)):
+                break
+        if not additions:
+            return compression
+
+        merged = " ".join(additions + [compressed]).strip()
+        compression["compressed_context"] = merged
+        compression["selected_sentences"] = additions + list(compression.get("selected_sentences") or [])
+        compression["compressed_token_count"] = len(merged.split())
+        original_token_count = int(compression.get("original_token_count") or 0)
+        if original_token_count > 0:
+            ratio = (original_token_count - compression["compressed_token_count"]) / original_token_count
+            compression["compression_ratio"] = round(ratio, 4)
+        meta = compression.get("compression_metadata") or {}
+        meta["session_priority_hits_injected"] = len(additions)
+        compression["compression_metadata"] = meta
+        return compression
+
+    def run(
+        self,
+        query: str,
+        session_documents: list[str] | None = None,
+        session_uploads: list[dict] | None = None,
+        session_retrieval_mode: str | None = None,
+    ) -> dict:
+        """Execute one full RAG pass and return answer + diagnostics payload."""
         run_start = time.perf_counter()
         print(f"\n{'='*60}")
         print(f"Query: {query}")
@@ -415,10 +614,100 @@ class RAGPipeline:
         elif normalized_query and normalized_query != (query or "").strip().lower():
             print(f"Normalized query: {normalized_query}")
         session_documents = [d for d in (session_documents or []) if isinstance(d, str) and d.strip()]
-        has_session_docs = len(session_documents) > 0
+        session_uploads = [u for u in (session_uploads or []) if isinstance(u, dict)]
+        has_session_docs = len(session_documents) > 0 or len(session_uploads) > 0
+        retrieval_mode = (session_retrieval_mode or os.getenv("SESSION_RETRIEVAL_MODE", "hybrid")).strip().lower()
+        if retrieval_mode not in {"upload_only", "hybrid"}:
+            retrieval_mode = "hybrid"
+        session_scope_hash = self._session_scope_hash(session_uploads, session_documents, retrieval_mode)
+        multimodal_embedding_used = False
+        multimodal_embedding_reason = "no_session_upload"
+        multimodal_hits_count = 0
+        multimodal_session_texts: list[str] = []
+        session_index_rebuilt = False
+        session_index_chunk_count = 0
+        session_embedding_tokens_saved = 0
 
-        # Fast path — semantic cache lookup before analyzer/retrieval/compression/router.
-        if not has_session_docs:
+        if session_uploads:
+            target_upload = None
+            for upload in session_uploads:
+                pdf_bytes = upload.get("bytes")
+                page_map = upload.get("pdf_text_by_page") or {}
+                if isinstance(pdf_bytes, (bytes, bytearray)) and pdf_bytes:
+                    target_upload = upload
+                    break
+                if isinstance(page_map, dict) and page_map:
+                    target_upload = upload
+                    break
+
+            if target_upload is None:
+                multimodal_embedding_reason = "no_upload_payload"
+            else:
+                try:
+                    upload_bytes = bytes(target_upload.get("bytes") or b"")
+                    page_map = target_upload.get("pdf_text_by_page") or {}
+                    has_visual_content = (
+                        bool(upload_bytes) and detect_visual_pdf(upload_bytes)
+                    )
+                    gemini_api_key = (os.getenv("GEMINI_API_KEY", "") or "").strip()
+                    use_gemini = bool(has_visual_content and gemini_api_key)
+                    retriever = SessionMultimodalRetriever(
+                        api_key=gemini_api_key,
+                        pdf_bytes=upload_bytes,
+                        pdf_text_by_page=page_map,
+                        use_gemini=use_gemini,
+                    )
+                    indexed_count = retriever.build_index()
+                    session_index_chunk_count = indexed_count
+                    session_index_rebuilt = not retriever.last_build_reused_cache
+                    if retriever.last_build_reused_cache:
+                        # Rough savings estimate for skipped embedding calls on cache hit.
+                        session_embedding_tokens_saved = int(
+                            indexed_count * float(retriever.avg_chunk_tokens or 0.0)
+                        )
+                        print(
+                            "[SessionMultimodal] "
+                            f"reusing index for {retriever.collection_name}, "
+                            f"skipping {indexed_count} chunk embeddings"
+                        )
+                    multimodal_hits = retriever.retrieve(corrected_query or normalized_query or query)
+                    multimodal_session_texts = [
+                        (h.get("text") or "").strip()
+                        for h in (multimodal_hits or [])
+                        if isinstance(h, dict) and (h.get("text") or "").strip()
+                    ]
+                    multimodal_hits_count = len(multimodal_session_texts)
+                    multimodal_embedding_used = multimodal_hits_count > 0
+                    if use_gemini:
+                        multimodal_embedding_reason = "pdf_contains_images"
+                    elif has_visual_content and not gemini_api_key:
+                        multimodal_embedding_reason = "visual_pdf_bge_fallback_no_key"
+                    else:
+                        multimodal_embedding_reason = "text_only_bge"
+                    print(
+                        "[SessionMultimodal] "
+                        f"indexed={indexed_count} | hits={multimodal_hits_count} | "
+                        f"use_gemini={use_gemini}"
+                    )
+                except SessionMultimodalError as exc:
+                    multimodal_embedding_reason = "session_retriever_failed"
+                    print(f"[SessionMultimodal] disabled due to retriever failure: {exc}")
+
+        # Fast path — cache lookup before analyzer/retrieval/compression/router.
+        if has_session_docs:
+            for candidate_query in self._build_query_variants(query, normalized_query, corrected_query):
+                ck = (session_scope_hash, candidate_query.lower().strip())
+                cached_result = self._session_query_cache.get(ck)
+                if cached_result is not None:
+                    out = dict(cached_result)
+                    out["cache_hit"] = True
+                    out["cache_similarity"] = 1.0
+                    diag = dict(out.get("retrieval_diagnostics") or {})
+                    diag["cache_hit"] = True
+                    out["retrieval_diagnostics"] = diag
+                    print("[SessionCache] Exact-match cache hit for current upload session.")
+                    return out
+        else:
             for candidate_query in self._build_query_variants(query, normalized_query, corrected_query):
                 cached_result = self.semantic_cache.lookup(candidate_query, self.corpus_hash)
                 if cached_result is not None:
@@ -446,6 +735,8 @@ class RAGPipeline:
         factual_fastpath_used = False
         factual_fastpath_hits = []
         factual_fastpath_answer = None
+        session_corpus_supplement_used = False
+        session_corpus_supplement_count = 0
         should_factual_fastpath = (
             not has_session_docs
             and ("simple_starter" in reason_codes)
@@ -483,12 +774,33 @@ class RAGPipeline:
             else:
                 print("[FactualFastPath] No strong extractive hit; falling back to standard retrieval.")
         if not factual_fastpath_used:
-            retrieval = self.retriever.retrieve(
-                query=retrieval_query,
-                complexity=complexity,
-                complexity_score=analysis.get("complexity_score"),
-                analyzer_confidence=analysis.get("confidence"),
-            )
+            if has_session_docs and retrieval_mode == "upload_only":
+                retrieval = {
+                    "docs": [],
+                    "k": 0,
+                    "complexity_used": complexity,
+                    "complexity_score_used": round(complexity_score_val, 2),
+                    "analyzer_confidence": analysis.get("confidence"),
+                    "k_base": 0,
+                    "k_final": 0,
+                    "coverage_score": 1.0,
+                    "coverage_threshold_used": None,
+                    "retry_confidence_gate_used": None,
+                    "retrieval_retry": False,
+                    "chunks": [],
+                    "rerank_enabled": False,
+                    "rerank_used": False,
+                    "rerank_model": "",
+                    "rerank_latency_ms": 0.0,
+                }
+                print("[SessionUploadMode] upload_only enabled; skipping Notre Dame corpus retrieval.")
+            else:
+                retrieval = self.retriever.retrieve(
+                    query=retrieval_query,
+                    complexity=complexity,
+                    complexity_score=analysis.get("complexity_score"),
+                    analyzer_confidence=analysis.get("confidence"),
+                )
         hyde_attempted = False
         hyde_used = False
         hyde_query = ""
@@ -537,16 +849,31 @@ class RAGPipeline:
             "factual_fastpath_used": factual_fastpath_used,
         }
         retrieval_ms = round((time.perf_counter() - t0) * 1000, 2)
-        docs = retrieval["docs"]
-        if has_session_docs:
-            docs = docs + session_documents
-            print(f"Added {len(session_documents)} session-level uploaded document(s) to context.")
+        corpus_retrieval_docs = list(retrieval.get("docs") or [])
+        docs = list(corpus_retrieval_docs)
+        session_context_docs = list(multimodal_session_texts) + list(session_documents)
+        if session_context_docs:
+            docs = docs + session_context_docs
+            print(
+                f"Added {len(session_context_docs)} session-level context chunk(s) "
+                f"(uploads={len(session_documents)}, multimodal_hits={len(multimodal_session_texts)})."
+            )
             session_chunks = []
             base_idx = len(retrieval["chunks"])
-            for i, _ in enumerate(session_documents):
+            for i, _ in enumerate(multimodal_session_texts):
                 session_chunks.append(
                     {
                         "chunk_index": base_idx + i,
+                        "source": f"session_multimodal_hit_{i+1}",
+                        "chroma_distance": "",
+                        "similarity_score": "",
+                    }
+                )
+            start = len(multimodal_session_texts)
+            for i, _ in enumerate(session_documents):
+                session_chunks.append(
+                    {
+                        "chunk_index": base_idx + start + i,
                         "source": f"session_upload_{i+1}",
                         "chroma_distance": "",
                         "similarity_score": "",
@@ -570,12 +897,28 @@ class RAGPipeline:
         use_factual_branch = False
         factual_hits = []
         extracted_answer = None
+        factual_query_check = self._is_factual_query(normalized_query or query)
+        session_extractive_allowed = (
+            has_session_docs
+            and retrieval_mode == "upload_only"
+            and self._is_session_extractive_query(normalized_query or query)
+        )
+        factual_extraction_attempted = factual_fastpath_attempted or (
+            (not has_session_docs and factual_query_check)
+            or session_extractive_allowed
+        )
         if factual_fastpath_used:
             factual_hits = factual_fastpath_hits
             extracted_answer = factual_fastpath_answer
             use_factual_branch = True
-        elif self._is_factual_query(normalized_query or query):
-            factual_hits = self.retriever.retrieve_factual_sentences(
+        elif (not has_session_docs) and factual_query_check:
+            factual_hits = self.retriever.retrieve_factual_sentences(normalized_query or query, top_n=20)
+            extracted_answer = self._extractive_answer(normalized_query or query, factual_hits)
+            if extracted_answer:
+                use_factual_branch = True
+        elif session_extractive_allowed:
+            factual_hits = self._retrieve_session_factual_sentences(
+                session_context_docs,
                 normalized_query or query,
                 top_n=20,
             )
@@ -620,13 +963,28 @@ class RAGPipeline:
         else:
             # Step 3 — Compress context
             t0 = time.perf_counter()
+            compression_complexity_score = analysis.get("complexity_score")
+            if has_session_docs:
+                try:
+                    compression_complexity_score = max(
+                        float(compression_complexity_score or 0.0),
+                        self.SESSION_UPLOAD_MIN_COMPLEXITY_SCORE,
+                    )
+                except (TypeError, ValueError):
+                    compression_complexity_score = self.SESSION_UPLOAD_MIN_COMPLEXITY_SCORE
             compression = self.compressor.compress(
                 corrected_query or normalized_query or query,
                 docs,
                 complexity,
-                complexity_score=analysis.get("complexity_score"),
+                complexity_score=compression_complexity_score,
                 coverage_score=retrieval.get("coverage_score"),
             )
+            if has_session_docs and multimodal_session_texts:
+                compression = self._inject_session_priority_context(
+                    compression,
+                    multimodal_session_texts,
+                    limit=self.SESSION_PRIORITY_HITS,
+                )
             compression_ms = round((time.perf_counter() - t0) * 1000, 2)
             _cm = compression.get("compression_metadata") or {}
             print(f"Tokens: {compression['original_token_count']} → {compression['compressed_token_count']} (ratio: {compression['compression_ratio']})")
@@ -649,7 +1007,70 @@ class RAGPipeline:
             compressed_context=compression["compressed_context"],
             router_output=router_result,
             analyzer_output=analysis,
+            context_sentences=compression.get("selected_sentences"),
+            context_sentence_embeddings=compression.get("_selected_sentence_embeddings"),
+            allow_retry=not (has_session_docs and retrieval_mode == "upload_only"),
         )
+        if (
+            has_session_docs
+            and retrieval_mode == "upload_only"
+            and router_result.get("model_source") != "extractive"
+            and confidence_result.get("model_used_final") != router_result.get("model_used")
+        ):
+            # In upload-only mode, keep local answer quality stable if stronger-model retry
+            # reroutes away from local model (often due unavailable networked fallback).
+            confidence_result["final_answer"] = router_result.get("answer", confidence_result.get("final_answer", ""))
+            confidence_result["model_used_final"] = router_result.get("model_used", confidence_result.get("model_used_final", ""))
+            confidence_result["retried"] = False
+            confidence_result["retry_reason"] = (confidence_result.get("retry_reason") or "") + " | kept_local_after_retry_failure"
+            confidence_result["retry_reason"] = confidence_result["retry_reason"].strip(" |")
+            confidence_result["confidence_score_final"] = float(
+                confidence_result.get("confidence_score_original", confidence_result.get("confidence_score_final", 0.0))
+            )
+        if (
+            has_session_docs
+            and retrieval_mode == "hybrid"
+            and multimodal_session_texts
+            and confidence_result.get("confidence_score_final", 1.0) < 0.50
+            and corpus_retrieval_docs
+            and not use_factual_branch
+        ):
+            supplement_docs = list(corpus_retrieval_docs[:3])
+            if supplement_docs:
+                session_corpus_supplement_used = True
+                session_corpus_supplement_count = len(supplement_docs)
+                print(
+                    "[SessionUploadMode] Low-confidence session answer; "
+                    f"supplementing with {session_corpus_supplement_count} corpus chunk(s)."
+                )
+                supplemented_docs = docs + supplement_docs
+                compression = self.compressor.compress(
+                    corrected_query or normalized_query or query,
+                    supplemented_docs,
+                    complexity,
+                    complexity_score=compression_complexity_score,
+                    coverage_score=retrieval.get("coverage_score"),
+                )
+                if multimodal_session_texts:
+                    compression = self._inject_session_priority_context(
+                        compression,
+                        multimodal_session_texts,
+                        limit=self.SESSION_PRIORITY_HITS,
+                    )
+                router_result = self.router.route(
+                    corrected_query or normalized_query or query,
+                    complexity,
+                    compression,
+                )
+                confidence_result = check_confidence(
+                    query=corrected_query or normalized_query or query,
+                    compressed_context=compression["compressed_context"],
+                    router_output=router_result,
+                    analyzer_output=analysis,
+                    context_sentences=compression.get("selected_sentences"),
+                    context_sentence_embeddings=compression.get("_selected_sentence_embeddings"),
+                    allow_retry=not (has_session_docs and retrieval_mode == "upload_only"),
+                )
         confidence_scoring_ms = round((time.perf_counter() - t_conf) * 1000, 2)
         robust_retry_ms = 0.0
         deep_openai_ms = 0.0
@@ -661,6 +1082,7 @@ class RAGPipeline:
         )
         should_retry_robust = (
             not has_session_docs
+            and complexity != "simple"
             and (
                 (
                     retrieval.get("coverage_score", 1.0) < 0.55
@@ -696,6 +1118,9 @@ class RAGPipeline:
                 compressed_context=robust_compression["compressed_context"],
                 router_output=robust_router,
                 analyzer_output=analysis,
+                context_sentences=robust_compression.get("selected_sentences"),
+                context_sentence_embeddings=robust_compression.get("_selected_sentence_embeddings"),
+                allow_retry=True,
             )
             if robust_confidence.get("confidence_score_final", 0.0) > confidence_result.get("confidence_score_final", 0.0):
                 print("Using robust retry result (improved confidence).")
@@ -765,6 +1190,7 @@ class RAGPipeline:
                     compressed_context=deep_context,
                     router_output=deep_router,
                     analyzer_output=analysis,
+                    allow_retry=True,
                 )
                 deep_grounded_ok, _ = self._grounding_gate(
                     deep_confidence.get("final_answer", ""),
@@ -786,11 +1212,60 @@ class RAGPipeline:
             confidence_result.get("final_answer", ""),
             compression.get("compressed_context", ""),
         )
+        if not grounded_ok and router_result.get("model_source") == "extractive":
+            print("[Pipeline] Extractive answer failed grounding; retrying with model generation.")
+            fallback_complexity_score = analysis.get("complexity_score")
+            if has_session_docs:
+                try:
+                    fallback_complexity_score = max(
+                        float(fallback_complexity_score or 0.0),
+                        self.SESSION_UPLOAD_MIN_COMPLEXITY_SCORE,
+                    )
+                except (TypeError, ValueError):
+                    fallback_complexity_score = self.SESSION_UPLOAD_MIN_COMPLEXITY_SCORE
+            fallback_compression = self.compressor.compress(
+                corrected_query or normalized_query or query,
+                docs,
+                complexity,
+                complexity_score=fallback_complexity_score,
+                coverage_score=retrieval.get("coverage_score"),
+            )
+            if has_session_docs and multimodal_session_texts:
+                fallback_compression = self._inject_session_priority_context(
+                    fallback_compression,
+                    multimodal_session_texts,
+                    limit=self.SESSION_PRIORITY_HITS,
+                )
+            fallback_router = self.router.route(
+                corrected_query or normalized_query or query,
+                complexity,
+                fallback_compression,
+            )
+            fallback_confidence = check_confidence(
+                query=corrected_query or normalized_query or query,
+                compressed_context=fallback_compression["compressed_context"],
+                router_output=fallback_router,
+                analyzer_output=analysis,
+                context_sentences=fallback_compression.get("selected_sentences"),
+                context_sentence_embeddings=fallback_compression.get("_selected_sentence_embeddings"),
+                allow_retry=not (has_session_docs and retrieval_mode == "upload_only"),
+            )
+            fallback_grounded_ok, fallback_grounding_meta = self._grounding_gate(
+                fallback_confidence.get("final_answer", ""),
+                fallback_compression.get("compressed_context", ""),
+            )
+            if fallback_grounded_ok:
+                compression = fallback_compression
+                router_result = fallback_router
+                confidence_result = fallback_confidence
+                grounded_ok = fallback_grounded_ok
+                grounding_meta = fallback_grounding_meta
         openai_fallback_attempted = False
         openai_fallback_used = False
         if not grounded_ok:
             can_escalate_openai = (
                 router_result.get("model_source") == "local_openai_compatible"
+                and not (has_session_docs and retrieval_mode == "upload_only")
                 and bool(os.getenv("OPENAI_API_KEY", "").strip())
                 and heavy_fallbacks_used < self.MAX_HEAVY_FALLBACKS
             )
@@ -808,6 +1283,9 @@ class RAGPipeline:
                         compressed_context=compression["compressed_context"],
                         router_output=openai_router_result,
                         analyzer_output=analysis,
+                        context_sentences=compression.get("selected_sentences"),
+                        context_sentence_embeddings=compression.get("_selected_sentence_embeddings"),
+                        allow_retry=True,
                     )
                     openai_grounded_ok, openai_grounding_meta = self._grounding_gate(
                         openai_confidence.get("final_answer", ""),
@@ -823,16 +1301,19 @@ class RAGPipeline:
                     print(f"[Pipeline] OpenAI fallback attempt failed: {type(exc).__name__}: {exc}")
 
             if not openai_fallback_used:
-                confidence_result["final_answer"] = (
-                    "I don't have enough grounded evidence in the retrieved context to answer this reliably. "
-                    "Please rephrase the query or provide more specific context."
-                )
-                confidence_result["confidence_score_final"] = min(
-                    float(confidence_result.get("confidence_score_final", 0.0)), 0.35
-                )
-                confidence_result["retry_reason"] = (
-                    (confidence_result.get("retry_reason") or "") + " | grounding_gate"
-                ).strip(" |")
+                if has_session_docs and retrieval_mode == "upload_only" and router_result.get("model_source") != "extractive":
+                    print("[Pipeline] Grounding gate soft-fail in upload_only mode; keeping local answer.")
+                else:
+                    confidence_result["final_answer"] = (
+                        "I don't have enough grounded evidence in the retrieved context to answer this reliably. "
+                        "Please rephrase the query or provide more specific context."
+                    )
+                    confidence_result["confidence_score_final"] = min(
+                        float(confidence_result.get("confidence_score_final", 0.0)), 0.35
+                    )
+                    confidence_result["retry_reason"] = (
+                        (confidence_result.get("retry_reason") or "") + " | grounding_gate"
+                    ).strip(" |")
         grounding_fallback_ms = round((time.perf_counter() - t_grounding) * 1000, 2)
         confidence_checker_ms = round(
             confidence_scoring_ms + robust_retry_ms + deep_openai_ms + grounding_fallback_ms,
@@ -964,6 +1445,15 @@ class RAGPipeline:
             "deep_openai_used": deep_openai_used,
             "max_heavy_fallbacks": self.MAX_HEAVY_FALLBACKS,
             "heavy_fallbacks_used": heavy_fallbacks_used,
+            "multimodal_embedding_used": multimodal_embedding_used,
+            "multimodal_embedding_reason": multimodal_embedding_reason,
+            "multimodal_hits_count": multimodal_hits_count,
+            "session_retrieval_mode": retrieval_mode,
+            "session_corpus_supplement_used": session_corpus_supplement_used,
+            "session_corpus_supplement_count": session_corpus_supplement_count,
+            "session_index_rebuilt": session_index_rebuilt,
+            "session_index_chunk_count": session_index_chunk_count,
+            "session_embedding_tokens_saved": session_embedding_tokens_saved,
             "cache_hit": False,
         }
         top_factual_hits = [
@@ -975,7 +1465,7 @@ class RAGPipeline:
             for h in (factual_hits or [])[:5]
         ]
         result["retrieval_diagnostics"] = {
-            "factual_extraction_attempted": self._is_factual_query(normalized_query or query),
+            "factual_extraction_attempted": factual_extraction_attempted,
             "factual_extraction_used": use_factual_branch,
             "factual_hit_count": len(factual_hits or []),
             "factual_top_hits": top_factual_hits,
@@ -1008,8 +1498,21 @@ class RAGPipeline:
             "deep_openai_used": deep_openai_used,
             "max_heavy_fallbacks": self.MAX_HEAVY_FALLBACKS,
             "heavy_fallbacks_used": heavy_fallbacks_used,
+            "multimodal_embedding_used": multimodal_embedding_used,
+            "multimodal_embedding_reason": multimodal_embedding_reason,
+            "multimodal_hits_count": multimodal_hits_count,
+            "session_retrieval_mode": retrieval_mode,
+            "session_corpus_supplement_used": session_corpus_supplement_used,
+            "session_corpus_supplement_count": session_corpus_supplement_count,
+            "session_index_rebuilt": session_index_rebuilt,
+            "session_index_chunk_count": session_index_chunk_count,
+            "session_embedding_tokens_saved": session_embedding_tokens_saved,
             "cache_hit": False,
         }
-        if not has_session_docs:
+        if has_session_docs:
+            for candidate_query in self._build_query_variants(query, normalized_query, corrected_query):
+                ck = (session_scope_hash, candidate_query.lower().strip())
+                self._session_query_cache[ck] = dict(result)
+        else:
             self.semantic_cache.store(query, result, self.corpus_hash)
         return result
