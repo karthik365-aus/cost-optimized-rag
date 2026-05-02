@@ -456,14 +456,32 @@ class RAGPipeline:
                     span_l = span.lower()
                     if len(span.split()) < 6:
                         continue
-                    if not any(m in span_l for m in (" is ", " are ", " refers to ", " defined as ", " means ")):
+                    definition_markers = (
+                        " is ",
+                        " are ",
+                        " refers to ",
+                        " defined as ",
+                        " means ",
+                        " combines ",
+                        " uses ",
+                    )
+                    if not any(m in span_l for m in definition_markers):
                         continue
-                    if subject_tokens and not (set(re.findall(r"[a-z0-9]+", span_l)) & subject_tokens):
+                    span_tokens = set(re.findall(r"[a-z0-9]+", span_l))
+                    token_overlap = len(span_tokens & subject_tokens)
+                    if subject_tokens and token_overlap == 0:
+                        continue
+                    subject_phrase_present = bool(subject and subject in span_l)
+                    if subject_tokens and not subject_phrase_present and len(subject_tokens) >= 2 and token_overlap < 2:
+                        # Avoid picking generic lines that only match one broad token
+                        # such as "retrieval" but miss the full concept phrase.
                         continue
                     score = (
                         0.6 * overlap_score(span)
                         + 0.4 * float(h.get("score", 0.0))
-                        + (0.15 if span_l.startswith(subject) else 0.0)
+                        + (0.35 if subject_phrase_present else 0.0)
+                        + (0.10 if span_l.startswith(subject) else 0.0)
+                        - (0.20 if ("retrieval" in span_l and not subject_phrase_present and len(subject_tokens) >= 2) else 0.0)
                     )
                     ranked_defs.append((score, span))
             if ranked_defs:
