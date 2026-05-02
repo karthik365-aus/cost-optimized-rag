@@ -1226,10 +1226,23 @@ class RAGPipeline:
             deep_openai_ms = round((time.perf_counter() - t_deep_openai) * 1000, 2)
 
         t_grounding = time.perf_counter()
-        grounded_ok, grounding_meta = self._grounding_gate(
-            confidence_result.get("final_answer", ""),
-            compression.get("compressed_context", ""),
-        )
+        if complexity == "complex" and retrieval.get("coverage_score", 0.0) >= 0.55:
+            # Analytical complex queries synthesize beyond exact entity matching
+            # Only bypass when retrieval quality is sufficient (coverage >= 0.55)
+            grounded_ok = True
+            grounding_meta = {
+                "reason": "skipped_for_complex_query",
+                "unsupported_entities": [],
+                "coverage_score": retrieval.get("coverage_score", 0.0)
+            }
+            print("[GroundingGate] Skipped for complex query — "
+                  f"coverage={retrieval.get('coverage_score', 0.0):.3f} >= 0.55, "
+                  "analytical synthesis expected.")
+        else:
+            grounded_ok, grounding_meta = self._grounding_gate(
+                confidence_result.get("final_answer", ""),
+                compression.get("compressed_context", ""),
+            )
         if not grounded_ok and router_result.get("model_source") == "extractive":
             print("[Pipeline] Extractive answer failed grounding; retrying with model generation.")
             fallback_complexity_score = analysis.get("complexity_score")

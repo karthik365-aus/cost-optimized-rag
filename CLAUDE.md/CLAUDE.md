@@ -943,3 +943,25 @@ _Appended; all sections above remain as-is._
   - `src/pipeline.py`
   - `ui.py`
 - Lint checks passed for touched files.
+
+## Updates — May 1, 2026 (complex-query grounding gate coverage-gated bypass)
+
+_Appended; all sections above remain as-is._
+
+### `src/pipeline.py` (call-site only, no grounding core changes)
+- Updated the main `run()` grounding-gate call site to support a coverage-gated bypass for analytical complex queries:
+  - if `complexity == "complex"` and `retrieval.coverage_score >= 0.55`, skip strict entity grounding for that turn,
+  - set `grounded_ok = True` with structured `grounding_meta`:
+    - `reason: "skipped_for_complex_query"`
+    - `unsupported_entities: []`
+    - `coverage_score: <value>`
+  - emit explicit runtime log via `print(...)` including coverage value.
+- All other behavior remains unchanged:
+  - complex queries with weak retrieval (`coverage < 0.55`) still run `_grounding_gate(...)`,
+  - simple/medium queries always run `_grounding_gate(...)`,
+  - `_grounding_gate()` implementation itself was not modified.
+
+### Quick verification
+- Compile check passed:
+  - `src/pipeline.py`
+- Lint checks passed for touched files.
